@@ -1,0 +1,60 @@
+package source
+
+import (
+	"context"
+	"log/slog"
+
+	"Canto/internal/db"
+)
+
+// Registry holds every known Processor, keyed by ID.
+type Registry struct {
+	processors map[string]Processor
+}
+
+// NewRegistry builds a Registry from processors.
+func NewRegistry(processors ...Processor) *Registry {
+	m := make(map[string]Processor, len(processors))
+	for _, p := range processors {
+		m[p.ID()] = p
+	}
+	return &Registry{processors: m}
+}
+
+// OrderedLink resolves ids to processors able to detect an origin_url right now in ids order.
+func (r *Registry) OrderedLink(ctx context.Context, ids []string) []Processor {
+	return r.ordered(ctx, ids, func(s State) bool { return s.CanDetect })
+}
+
+// OrderedFallback resolves ids to processors able to look up by text query right now in ids order.
+func (r *Registry) OrderedFallback(ctx context.Context, ids []string) []Processor {
+	return r.ordered(ctx, ids, func(s State) bool { return s.CanLookup })
+}
+
+// ByType looks up the registered processor for sourceType, regardless of configured ordering.
+func (r *Registry) ByType(sourceType db.SourceType) (Processor, bool) {
+	for _, p := range r.processors {
+		if p.Type() == sourceType {
+			return p, true
+		}
+	}
+	return nil, false
+}
+
+// ordered resolves ids to registered capable processors in order.
+func (r *Registry) ordered(ctx context.Context, ids []string, capable func(State) bool) []Processor {
+	out := make([]Processor, 0, len(ids))
+	for _, id := range ids {
+		p, ok := r.processors[id]
+		if !ok {
+			slog.Warn("configured processor not registered, skipping", "id", id)
+			continue
+		}
+		if !capable(p.State(ctx)) {
+			slog.Warn("configured processor not currently available, skipping", "id", id)
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
+}

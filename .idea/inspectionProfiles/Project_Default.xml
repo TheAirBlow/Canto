@@ -1,0 +1,16 @@
+<component name="InspectionProjectProfileManager">
+  <profile version="1.0">
+    <option name="myName" value="Project Default" />
+    <inspection_tool class="GoDfaErrorMayBeNotNil" enabled="true" level="WARNING" enabled_by_default="true">
+      <methods>
+        <method importPath="Canto/internal/db" receiver="*Queries" name="FindSongByExactNameForArtists" />
+        <method importPath="Canto/internal/db" receiver="*Queries" name="FindSongByExactNameForArtistsAndAlbum" />
+        <method importPath="Canto/internal/db" receiver="*Queries" name="FindSongByExactName" />
+        <method importPath="Canto/internal/db" receiver="*Queries" name="FindAlbumByExactNameForArtists" />
+        <method importPath="Canto/internal/db" receiver="*Queries" name="FindAlbumByExactName" />
+        <method importPath="Canto/internal/db" receiver="*Queries" name="FindArtistByExactName" />
+      </methods>
+    </inspection_tool>
+    <inspection_tool class="SqlNoDataSourceInspection" enabled="false" level="WARNING" enabled_by_default="false" />
+  </profile>
+</component>
