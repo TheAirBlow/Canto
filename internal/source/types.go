@@ -2,8 +2,20 @@ package source
 
 import (
 	"context"
+)
 
-	"Canto/internal/db"
+// SourceType discriminates which platform a source record was correlated against.
+type SourceType string
+
+const (
+	SourceTypeYtmusic     SourceType = "ytmusic"
+	SourceTypeSpotify     SourceType = "spotify"
+	SourceTypeBandcamp    SourceType = "bandcamp"
+	SourceTypeMusicbrainz SourceType = "musicbrainz"
+	SourceTypeLastfm      SourceType = "lastfm"
+	SourceTypeDeezer      SourceType = "deezer"
+	SourceTypeSubsonic    SourceType = "subsonic"
+	SourceTypeUnknown     SourceType = "unknown"
 )
 
 // ArtistMetadata describes one artist, either as a song/album credit or from a full FetchArtist lookup.
@@ -85,5 +97,5 @@ type Processor interface {
 	State(ctx context.Context) State
 
 	// Type returns this processor's source type discriminator.
-	Type() db.SourceType
+	Type() SourceType
 }

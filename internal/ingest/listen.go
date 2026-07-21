@@ -13,6 +13,7 @@ import (
 	"Canto/internal/correlate"
 	"Canto/internal/db"
 	"Canto/internal/enrich"
+	"Canto/internal/rollup"
 	"Canto/internal/source"
 )
 
@@ -65,11 +66,15 @@ type Service struct {
 	engine   *correlate.Engine
 	queries  *db.Queries
 	lookup   *enrich.Lookup
+	rollup   *rollup.Writer
 }
 
 // NewService builds a Service.
-func NewService(registry *source.Registry, matchers *correlate.MatcherRegistry, engine *correlate.Engine, queries *db.Queries) *Service {
-	return &Service{registry: registry, matchers: matchers, engine: engine, queries: queries, lookup: enrich.NewLookup(queries, registry)}
+func NewService(registry *source.Registry, matchers *correlate.MatcherRegistry, engine *correlate.Engine, queries *db.Queries, rollupWriter *rollup.Writer) *Service {
+	return &Service{
+		registry: registry, matchers: matchers, engine: engine, queries: queries,
+		lookup: enrich.NewLookup(queries, registry), rollup: rollupWriter,
+	}
 }
 
 // SubmitListen resolves in's source, artists, album, and song under settings, then records the result.
@@ -84,7 +89,7 @@ func (s *Service) SubmitListen(ctx context.Context, in ListenInput, settings Pro
 		meta.Album = &source.AlbumMetadata{Name: in.AlbumName}
 	}
 
-	var activeType db.SourceType
+	var activeType source.SourceType
 	var extractedID, rawURL string
 
 	linkProcessors := s.registry.OrderedLink(ctx, settings.LinkOrder)
@@ -215,6 +220,12 @@ func (s *Service) SubmitListen(ctx context.Context, in ListenInput, settings Pro
 	if err != nil {
 		return db.Listen{}, fmt.Errorf("ingest: create listen: %w", err)
 	}
+
+	s.rollup.Record(rollup.ListenEvent{
+		UserID: in.UserID, SongID: songID, ArtistIDs: artistIDs, AlbumID: albumID,
+		ListenedAt: in.ListenedAt, PlayedMs: playedMs, SongDurationMs: meta.DurationMs,
+		Imported: in.OriginalSubmissionClient != "",
+	})
 	return listen, nil
 }
 
@@ -251,8 +262,7 @@ func mergeMetadata(base, add source.Metadata) source.Metadata {
 	return base
 }
 
-// clearMetaSourceIDs strips every per-entity ExtractedID off meta, keeping names/other fields, so ids from
-// a source no longer considered active can't be paired with an empty source type during resolution.
+// clearMetaSourceIDs strips every per-entity ExtractedID off meta, so a no-longer-active source's ids can't leak into resolution.
 func clearMetaSourceIDs(meta source.Metadata) source.Metadata {
 	meta.ExtractedID = ""
 	if len(meta.Artists) > 0 {

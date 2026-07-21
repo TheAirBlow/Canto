@@ -11,6 +11,7 @@ import (
 	"Canto/internal/importer"
 	"Canto/internal/ingest"
 	"Canto/internal/search"
+	"Canto/internal/stats"
 )
 
 // Deps holds every dependency Server's handlers need.
@@ -25,6 +26,7 @@ type Deps struct {
 	Search         *search.Client
 	Importer       *importer.Manager
 	Export         *export.Service
+	Stats          *stats.Engine
 }
 
 // Server holds the dependencies every REST handler needs.
@@ -39,6 +41,7 @@ type Server struct {
 	search         *search.Client
 	importer       *importer.Manager
 	export         *export.Service
+	stats          *stats.Engine
 }
 
 // NewServer builds a Server from deps.
@@ -54,13 +57,14 @@ func NewServer(deps Deps) *Server {
 		search:         deps.Search,
 		importer:       deps.Importer,
 		export:         deps.Export,
+		stats:          deps.Stats,
 	}
 }
 
 // Register mounts every Canto API route onto mux.
 func (s *Server) Register(mux *http.ServeMux) {
 	api := authMux{ServeMux: http.NewServeMux(), server: *s}
-	s.registerUser(api)
+	s.registerUsers(api)
 	s.registerAPIKeys(api)
 	s.registerSettings(api)
 	s.registerListenBrainz(api)
@@ -72,6 +76,7 @@ func (s *Server) Register(mux *http.ServeMux) {
 	s.registerExport(api)
 	s.registerImport(api)
 	s.registerImages(api)
+	s.registerStats(api)
 	api.HandleFunc("GET /health", s.health)
 	mux.Handle("/api/", http.StripPrefix("/api", api))
 }

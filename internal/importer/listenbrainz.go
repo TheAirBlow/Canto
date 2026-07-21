@@ -1,10 +1,10 @@
 package importer
 
 import (
+	"context"
 	"io"
 	"time"
 
-	"Canto/internal/db"
 	"Canto/internal/ingest"
 )
 
@@ -15,7 +15,7 @@ type listenBrainzFormat struct{}
 func newListenBrainzFormat() Format { return listenBrainzFormat{} }
 
 // ID identifies this format's import_service discriminator.
-func (listenBrainzFormat) ID() db.ImportService { return db.ImportServiceListenbrainz }
+func (listenBrainzFormat) ID() ImportService { return ImportServiceListenbrainz }
 
 // lbExportEntry is one entry in a ListenBrainz export.
 type lbExportEntry struct {
@@ -33,14 +33,9 @@ type lbExportEntry struct {
 	} `json:"track_metadata"`
 }
 
-// CountEntries does a cheap structural scan of r for the raw top-level entry count.
-func (listenBrainzFormat) CountEntries(r io.Reader) (int, error) {
-	return countJSONArray(r)
-}
-
-// Parse streams r, calling emit once per raw top-level entry.
-func (listenBrainzFormat) Parse(r io.Reader, emit func(ingest.ListenInput)) error {
-	return decodeJSONArray(r, func(e lbExportEntry) {
+// Parse returns r's total entry count immediately, then streams entries from startIdx onward to out in the background.
+func (listenBrainzFormat) Parse(ctx context.Context, r io.Reader, out chan<- ingest.ListenInput, startIdx int) (int, error) {
+	return parseJSONArray(ctx, r, out, startIdx, func(e lbExportEntry) ingest.ListenInput {
 		info := e.TrackMetadata.AdditionalInfo
 		originURL := info.OriginURL
 		if originURL == "" {
@@ -51,7 +46,7 @@ func (listenBrainzFormat) Parse(r io.Reader, emit func(ingest.ListenInput)) erro
 			durationMs = *info.DurationMs
 		}
 
-		emit(ingest.ListenInput{
+		return ingest.ListenInput{
 			OriginalSubmissionClient: "listenbrainz_export",
 			OriginURL:                originURL,
 			ArtistNames:              []string{e.TrackMetadata.ArtistName},
@@ -59,6 +54,6 @@ func (listenBrainzFormat) Parse(r io.Reader, emit func(ingest.ListenInput)) erro
 			AlbumName:                e.TrackMetadata.ReleaseName,
 			ListenedAt:               time.Unix(e.ListenedAt, 0).UTC(),
 			DurationMs:               durationMs,
-		})
+		}
 	})
 }

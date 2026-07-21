@@ -40,7 +40,7 @@ func (c *Client) Enabled() bool {
 }
 
 // indexes lists every entity-type index this client maintains.
-var indexes = []string{"artists", "albums", "songs"}
+var indexes = []string{"artists", "albums", "songs", "users"}
 
 // Document is one catalog entity as indexed in Meilisearch.
 type Document struct {
@@ -235,8 +235,34 @@ func (c *Client) Reindex(ctx context.Context, queries *db.Queries) error {
 		}
 	}
 
-	slog.Info("search: reindex complete", "artists", artistCount, "albums", albumCount, "songs", songCount)
+	var userCount int
+	after = 0
+	for {
+		rows, err := queries.ListPublicUsers(ctx, db.ListPublicUsersParams{After: after, MaxRows: reindexBatchSize})
+		if err != nil {
+			return fmt.Errorf("search: reindex list users: %w", err)
+		}
+		for _, row := range rows {
+			c.Upsert(ctx, "users", UserDocument(row))
+			after = row.ID
+		}
+		userCount += len(rows)
+		if len(rows) < reindexBatchSize {
+			break
+		}
+	}
+
+	slog.Info("search: reindex complete", "artists", artistCount, "albums", albumCount, "songs", songCount, "users", userCount)
 	return nil
+}
+
+// UserDocument builds a public user's search Document; username is already normalized by ValidateUsername.
+func UserDocument(u db.User) Document {
+	name := u.Username
+	if u.DisplayName != nil && *u.DisplayName != "" {
+		name = *u.DisplayName
+	}
+	return Document{ID: u.ID, EntityType: "user", Name: name, NameNormalized: u.Username}
 }
 
 // buildAlbumDocument assembles album's search Document, including its current linked artists.

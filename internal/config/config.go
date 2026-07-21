@@ -22,6 +22,12 @@ type Config struct {
 	Processors  ProcessorsConfig  `json:"processors"`
 	Ingest      IngestConfig      `json:"ingest"`
 	Refresh     RefreshConfig     `json:"refresh"`
+	Rollup      RollupConfig      `json:"rollup"`
+}
+
+// RollupConfig controls the stats rollup writer's batching cadence.
+type RollupConfig struct {
+	FlushInterval time.Duration `json:"flush_interval"`
 }
 
 // RefreshConfig controls the background metadata-refresh worker.
@@ -109,7 +115,7 @@ func defaults() Config {
 			MusicBrainzRateLimit: 1,
 		},
 		Import: ImportConfig{
-			Workers: 64,
+			Workers: 32,
 		},
 		Stats: StatsConfig{
 			RegenInterval: 5 * time.Minute,
@@ -132,6 +138,9 @@ func defaults() Config {
 		Refresh: RefreshConfig{
 			Interval: 7 * 24 * time.Hour,
 			Entities: []string{"artist"},
+		},
+		Rollup: RollupConfig{
+			FlushInterval: time.Second,
 		},
 	}
 }
@@ -173,6 +182,7 @@ func Load(dataDir string) (Config, error) {
 	cfg.Ingest.Enabled = envStringSlice("CANTO_INGEST_ENABLED", cfg.Ingest.Enabled)
 	cfg.Refresh.Interval = envDuration("CANTO_REFRESH_INTERVAL", cfg.Refresh.Interval)
 	cfg.Refresh.Entities = envStringSlice("CANTO_REFRESH_ENTITIES", cfg.Refresh.Entities)
+	cfg.Rollup.FlushInterval = envDuration("CANTO_ROLLUP_FLUSH_INTERVAL", cfg.Rollup.FlushInterval)
 
 	return cfg, nil
 }

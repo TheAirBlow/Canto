@@ -29,12 +29,9 @@ func (m *Manager) finalPath(jobID int64, filename string) string {
 	return filepath.Join(m.dataDir, "import", fmt.Sprintf("%d", jobID), filename)
 }
 
-// CreateBatch spools every file to scratch space, inserts one import_jobs row per file in a single
-// transaction (all sharing one batch_id), then moves each file into its job's final directory --
-// per DESIGN.md §4a, nothing is ever queued or left on disk without an owning committed job row.
-func (m *Manager) CreateBatch(ctx context.Context, userID int64, service db.ImportService, files []UploadedFile) ([]db.ImportJob, error) {
-	format, ok := m.formats[service]
-	if !ok {
+// CreateBatch spools every file to scratch space, inserts one import_jobs row per file in one transaction, then moves each file into its job's final directory.
+func (m *Manager) CreateBatch(ctx context.Context, userID int64, service ImportService, files []UploadedFile) ([]db.ImportJob, error) {
+	if _, ok := m.formats[service]; !ok {
 		return nil, fmt.Errorf("importer: unsupported service %q", service)
 	}
 	if err := os.MkdirAll(m.scratchDir(), 0o755); err != nil {
@@ -44,7 +41,6 @@ func (m *Manager) CreateBatch(ctx context.Context, userID int64, service db.Impo
 	type spooled struct {
 		filename string
 		tempPath string
-		total    int
 	}
 	var spool []spooled
 	renamed := false
@@ -67,17 +63,7 @@ func (m *Manager) CreateBatch(ctx context.Context, userID int64, service db.Impo
 			return nil, fmt.Errorf("importer: spool %s: %w", f.Filename, err)
 		}
 		tmp.Close()
-
-		counted, err := os.Open(tmp.Name())
-		if err != nil {
-			return nil, fmt.Errorf("importer: reopen %s: %w", f.Filename, err)
-		}
-		total, err := format.CountEntries(counted)
-		counted.Close()
-		if err != nil {
-			return nil, fmt.Errorf("importer: count entries in %s: %w", f.Filename, err)
-		}
-		spool = append(spool, spooled{filename: f.Filename, tempPath: tmp.Name(), total: total})
+		spool = append(spool, spooled{filename: f.Filename, tempPath: tmp.Name()})
 	}
 
 	batchID := uuid.New()
@@ -92,7 +78,7 @@ func (m *Manager) CreateBatch(ctx context.Context, userID int64, service db.Impo
 	for _, sp := range spool {
 		job, err := q.CreateImportJob(ctx, db.CreateImportJobParams{
 			UserID: userID, BatchID: pgtype.UUID{Bytes: batchID, Valid: true},
-			Filename: sp.filename, Service: service, TotalItems: int32(sp.total),
+			Filename: sp.filename, Service: string(service), TotalItems: 0,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("importer: create job row: %w", err)
@@ -115,7 +101,7 @@ func (m *Manager) CreateBatch(ctx context.Context, userID int64, service db.Impo
 	renamed = true
 
 	for _, job := range jobs {
-		m.runAsync(job)
+		m.runAsync(job, 0)
 	}
 	return jobs, nil
 }
@@ -130,7 +116,7 @@ func (m *Manager) GetJob(ctx context.Context, userID, id int64) (db.ImportJob, e
 	return m.queries.GetImportJob(ctx, db.GetImportJobParams{ID: id, UserID: userID})
 }
 
-// CancelJob cancels userID's queued or running job id, reporting whether a row was actually cancelled.
+// CancelJob cancels userID's queued, running, or paused job id, reporting whether a row was actually cancelled.
 func (m *Manager) CancelJob(ctx context.Context, userID, id int64) (bool, error) {
 	rows, err := m.queries.CancelImportJob(ctx, db.CancelImportJobParams{ID: id, UserID: userID})
 	return rows > 0, err

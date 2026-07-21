@@ -7,9 +7,7 @@ import (
 	"time"
 )
 
-// lastFMTestAPIKeyEnv names the env var carrying a real Last.fm API key for the live tests below.
-// Last.fm requires a key for every request (unlike Spotify/Deezer/MusicBrainz), so these skip
-// entirely when it's unset rather than asserting against an unauthenticated failure.
+// lastFMTestAPIKeyEnv names the env var for a live Last.fm key; these tests skip when it's unset since Last.fm requires a key for every request.
 const lastFMTestAPIKeyEnv = "CANTO_TEST_LASTFM_API_KEY"
 
 // newTestLastFMProcessor builds a lastFMProcessor keyed from the environment, skipping t if unset.

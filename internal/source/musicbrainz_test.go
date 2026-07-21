@@ -18,10 +18,7 @@ func newTestMusicBrainzProcessor() Processor {
 	return NewMusicBrainzProcessor("https://musicbrainz.org/ws/2", 1)
 }
 
-// TestMusicBrainzFetchMetadata hits the real API and checks every deterministic field comes back
-// verbatim. Which release MusicBrainz reports first for a recording linked to many isn't guaranteed
-// stable, so Album's specific title/id isn't asserted -- only that one came back, and that its
-// Cover Art Archive URL is derived from that same id.
+// TestMusicBrainzFetchMetadata hits the real API and checks every deterministic field except Album's exact release, which MusicBrainz doesn't return stably.
 func TestMusicBrainzFetchMetadata(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()

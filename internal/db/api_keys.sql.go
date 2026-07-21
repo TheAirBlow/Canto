@@ -51,7 +51,7 @@ func (q *Queries) DeleteAPIKey(ctx context.Context, arg DeleteAPIKeyParams) (int
 }
 
 const getUserByAPIKeyHash = `-- name: GetUserByAPIKeyHash :one
-SELECT users.id, users.username, users.password_hash, users.public_stats, users.is_admin, users.created_at FROM users
+SELECT users.id, users.username, users.password_hash, users.display_name, users.description, users.image_id, users.public, users.is_admin, users.created_at FROM users
 JOIN api_keys ON api_keys.user_id = users.id
 WHERE api_keys.key_hash = $1
 `
@@ -63,7 +63,10 @@ func (q *Queries) GetUserByAPIKeyHash(ctx context.Context, keyHash string) (User
 		&i.ID,
 		&i.Username,
 		&i.PasswordHash,
-		&i.PublicStats,
+		&i.DisplayName,
+		&i.Description,
+		&i.ImageID,
+		&i.Public,
 		&i.IsAdmin,
 		&i.CreatedAt,
 	)

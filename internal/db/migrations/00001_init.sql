@@ -1,16 +1,17 @@
 -- +goose Up
 
 CREATE TYPE entity_type AS ENUM ('artist', 'album', 'song');
-CREATE TYPE source_type AS ENUM ('ytmusic', 'spotify', 'bandcamp', 'musicbrainz', 'lastfm', 'deezer', 'subsonic', 'unknown');
 CREATE TYPE correlation_method AS ENUM ('source_id', 'fuzzy_name', 'manual');
-CREATE TYPE import_service AS ENUM ('spotify', 'ytmusic', 'lastfm', 'listenbrainz', 'maloja', 'canto_export');
-CREATE TYPE import_status AS ENUM ('queued', 'running', 'completed', 'failed', 'cancelled');
+CREATE TYPE import_status AS ENUM ('queued', 'running', 'paused', 'completed', 'failed', 'cancelled');
 
 CREATE TABLE users (
     id             BIGSERIAL PRIMARY KEY,
-    username       TEXT NOT NULL UNIQUE,
+    username       TEXT NOT NULL UNIQUE CHECK (username ~ '^[a-z0-9_.]{2,32}$'),
     password_hash  TEXT NOT NULL,
-    public_stats   BOOLEAN NOT NULL DEFAULT FALSE,
+    display_name   TEXT,
+    description    TEXT,
+    image_id       UUID,
+    public         BOOLEAN NOT NULL DEFAULT TRUE,
     is_admin       BOOLEAN NOT NULL DEFAULT FALSE,
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -127,7 +128,7 @@ CREATE TABLE sources (
     id                  BIGSERIAL PRIMARY KEY,
     entity_type         entity_type NOT NULL,
     entity_id           BIGINT NOT NULL,
-    source_type         source_type NOT NULL,
+    source_type         TEXT NOT NULL,
     raw_url             TEXT,
     extracted_id        TEXT,
     correlation_method  correlation_method NOT NULL,
@@ -183,7 +184,7 @@ CREATE TABLE import_jobs (
     user_id          BIGINT NOT NULL REFERENCES users (id) ON DELETE CASCADE,
     batch_id         UUID NOT NULL,
     filename         TEXT NOT NULL,
-    service          import_service NOT NULL,
+    service          TEXT NOT NULL,
     status           import_status NOT NULL DEFAULT 'queued',
     total_items      INTEGER NOT NULL DEFAULT 0,
     processed_items  INTEGER NOT NULL DEFAULT 0,
@@ -200,8 +201,83 @@ CREATE INDEX import_jobs_user_id_idx ON import_jobs (user_id);
 CREATE INDEX import_jobs_batch_id_idx ON import_jobs (batch_id);
 CREATE INDEX import_jobs_status_idx ON import_jobs (status);
 
+CREATE TYPE stats_resource AS ENUM (
+    'summary', 'top_artists', 'top_albums', 'top_tracks', 'activity',
+    'interest', 'clock', 'sources', 'discovery', 'rewind'
+);
+
+CREATE TABLE stats_cache (
+    id           BIGSERIAL PRIMARY KEY,
+    user_id      BIGINT REFERENCES users (id) ON DELETE CASCADE,
+    artist_id    BIGINT REFERENCES artists (id) ON DELETE CASCADE,
+    album_id     BIGINT REFERENCES albums (id) ON DELETE CASCADE,
+    song_id      BIGINT REFERENCES songs (id) ON DELETE CASCADE,
+    resource     stats_resource NOT NULL,
+    params       JSONB NOT NULL DEFAULT '{}',
+    data         JSONB NOT NULL,
+    computed_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE UNIQUE INDEX stats_cache_key_idx ON stats_cache
+    (user_id, artist_id, album_id, song_id, resource, params) NULLS NOT DISTINCT;
+
+CREATE TABLE daily_song_listens (
+    user_id      BIGINT NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    song_id      BIGINT NOT NULL REFERENCES songs (id) ON DELETE CASCADE,
+    day          DATE NOT NULL,
+    listen_count INTEGER NOT NULL DEFAULT 0,
+    minutes_ms   BIGINT NOT NULL DEFAULT 0,
+    PRIMARY KEY (user_id, song_id, day)
+);
+
+CREATE INDEX daily_song_listens_user_day_idx ON daily_song_listens (user_id, day);
+CREATE INDEX daily_song_listens_song_idx ON daily_song_listens (song_id);
+
+CREATE TABLE clock_cells (
+    user_id      BIGINT NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    day          DATE NOT NULL,
+    hour         SMALLINT NOT NULL,
+    listen_count INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (user_id, day, hour)
+);
+
+CREATE INDEX clock_cells_user_day_idx ON clock_cells (user_id, day);
+
+CREATE TABLE user_listen_state (
+    user_id          BIGINT PRIMARY KEY REFERENCES users (id) ON DELETE CASCADE,
+    last_listened_at TIMESTAMPTZ,
+    current_streak   INTEGER NOT NULL DEFAULT 0,
+    longest_streak   INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE user_entity_first_listen (
+    user_id     BIGINT NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    entity_type entity_type NOT NULL,
+    entity_id   BIGINT NOT NULL,
+    first_at    TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (user_id, entity_type, entity_id)
+);
+
+CREATE INDEX user_entity_first_listen_first_at_idx ON user_entity_first_listen (user_id, entity_type, first_at);
+
+CREATE TABLE entity_global_stats (
+    entity_type       entity_type NOT NULL,
+    entity_id         BIGINT NOT NULL,
+    plays             INTEGER NOT NULL DEFAULT 0,
+    unique_listeners  INTEGER NOT NULL DEFAULT 0,
+    first_listened_at TIMESTAMPTZ,
+    PRIMARY KEY (entity_type, entity_id)
+);
+
 -- +goose Down
 
+DROP TABLE entity_global_stats;
+DROP TABLE user_entity_first_listen;
+DROP TABLE user_listen_state;
+DROP TABLE clock_cells;
+DROP TABLE daily_song_listens;
+DROP TABLE stats_cache;
+DROP TYPE stats_resource;
 DROP TABLE import_jobs;
 DROP TABLE artist_blacklist;
 DROP TABLE now_playing;
@@ -220,7 +296,5 @@ DROP TABLE api_keys;
 DROP TABLE user_settings;
 DROP TABLE users;
 DROP TYPE import_status;
-DROP TYPE import_service;
 DROP TYPE correlation_method;
-DROP TYPE source_type;
 DROP TYPE entity_type;

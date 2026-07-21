@@ -1,39 +1,29 @@
 package importer
 
 import (
+	"context"
 	"encoding/json"
 	"io"
+
+	"Canto/internal/ingest"
 )
 
-// countJSONArray returns the number of top-level elements in a JSON array read from r.
-func countJSONArray(r io.Reader) (int, error) {
-	dec := json.NewDecoder(r)
-	if _, err := dec.Token(); err != nil {
+// parseJSONArray decodes a top-level JSON array from r and returns its element count immediately, then converts each element at or past startIdx via toListen and streams it to out in the background, closing out when done.
+func parseJSONArray[T any](ctx context.Context, r io.Reader, out chan<- ingest.ListenInput, startIdx int, toListen func(T) ingest.ListenInput) (int, error) {
+	var items []T
+	if err := json.NewDecoder(r).Decode(&items); err != nil {
 		return 0, err
 	}
-	var count int
-	for dec.More() {
-		var raw json.RawMessage
-		if err := dec.Decode(&raw); err != nil {
-			return 0, err
-		}
-		count++
-	}
-	return count, nil
-}
 
-// decodeJSONArray streams a top-level JSON array from r, calling fn with each decoded element.
-func decodeJSONArray[T any](r io.Reader, fn func(T)) error {
-	dec := json.NewDecoder(r)
-	if _, err := dec.Token(); err != nil {
-		return err
-	}
-	for dec.More() {
-		var item T
-		if err := dec.Decode(&item); err != nil {
-			return err
+	go func() {
+		defer close(out)
+		for i := startIdx; i < len(items); i++ {
+			select {
+			case out <- toListen(items[i]):
+			case <-ctx.Done():
+				return
+			}
 		}
-		fn(item)
-	}
-	return nil
+	}()
+	return len(items), nil
 }

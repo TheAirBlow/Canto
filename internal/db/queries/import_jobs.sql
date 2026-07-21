@@ -14,6 +14,9 @@ SELECT * FROM import_jobs WHERE id = $1;
 -- name: StartImportJob :exec
 UPDATE import_jobs SET status = 'running', started_at = now() WHERE id = $1;
 
+-- name: SetImportJobTotal :exec
+UPDATE import_jobs SET total_items = $2 WHERE id = $1;
+
 -- name: IncrementImportProgress :exec
 UPDATE import_jobs SET
   processed_items = processed_items + 1,
@@ -27,7 +30,16 @@ UPDATE import_jobs SET status = $2, error_message = $3, finished_at = now() WHER
 
 -- name: CancelImportJob :execrows
 UPDATE import_jobs SET status = 'cancelled', finished_at = now()
-WHERE id = $1 AND user_id = $2 AND status IN ('queued', 'running');
+WHERE id = $1 AND user_id = $2 AND status IN ('queued', 'running', 'paused');
 
--- name: ResetStaleRunningImportJobs :many
-UPDATE import_jobs SET status = 'queued', started_at = NULL WHERE status = 'running' RETURNING *;
+-- name: PauseImportJob :exec
+UPDATE import_jobs SET status = 'paused' WHERE id = $1;
+
+-- name: FailInterruptedImportJobs :many
+UPDATE import_jobs SET status = 'failed',
+  error_message = 'server restarted while this job was running; progress could not be verified',
+  finished_at = now()
+WHERE status = 'running' RETURNING *;
+
+-- name: ListResumableImportJobs :many
+SELECT * FROM import_jobs WHERE status IN ('queued', 'paused') ORDER BY created_at;

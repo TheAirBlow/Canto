@@ -1,10 +1,10 @@
 package importer
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 
-	"Canto/internal/db"
 	"Canto/internal/export"
 	"Canto/internal/ingest"
 )
@@ -16,66 +16,63 @@ type cantoExportFormat struct{}
 func newCantoExportFormat() Format { return cantoExportFormat{} }
 
 // ID identifies this format's import_service discriminator.
-func (cantoExportFormat) ID() db.ImportService { return db.ImportServiceCantoExport }
+func (cantoExportFormat) ID() ImportService { return ImportServiceCantoExport }
 
-// CountEntries does a cheap structural scan of r for the raw top-level entry count.
-func (f cantoExportFormat) CountEntries(r io.Reader) (int, error) {
+// Parse returns doc's total entry count immediately, then streams entries from startIdx onward to out in the background.
+func (f cantoExportFormat) Parse(ctx context.Context, r io.Reader, out chan<- ingest.ListenInput, startIdx int) (int, error) {
 	doc, err := f.decode(r)
 	if err != nil {
 		return 0, err
 	}
+
+	go func() {
+		defer close(out)
+		for i := startIdx; i < len(doc.Listens); i++ {
+			l := doc.Listens[i]
+			entry := ingest.ListenInput{OriginalSubmissionClient: "canto_export"}
+
+			if song, ok := doc.Songs[l.SongID]; ok {
+				artistNames := make([]string, 0, len(song.ArtistIDs))
+				for _, artistID := range song.ArtistIDs {
+					if artist, ok := doc.Artists[artistID]; ok {
+						artistNames = append(artistNames, artist.Name)
+					}
+				}
+				var albumName string
+				if song.AlbumID != nil {
+					if album, ok := doc.Albums[*song.AlbumID]; ok {
+						albumName = album.Name
+					}
+				}
+				var durationMs int32
+				if song.DurationMs != nil {
+					durationMs = *song.DurationMs
+				}
+				var originURL string
+				for _, s := range song.Sources {
+					if s.RawURL != nil && *s.RawURL != "" {
+						originURL = *s.RawURL
+						break
+					}
+				}
+
+				entry.SubmissionClient = l.Client
+				entry.OriginURL = originURL
+				entry.ArtistNames = artistNames
+				entry.SongName = song.Name
+				entry.AlbumName = albumName
+				entry.DurationMs = durationMs
+				entry.ListenedAt = l.ListenedAt
+			}
+
+			select {
+			case out <- entry:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 	return len(doc.Listens), nil
-}
-
-// Parse streams r, calling emit once per raw top-level entry.
-func (f cantoExportFormat) Parse(r io.Reader, emit func(ingest.ListenInput)) error {
-	doc, err := f.decode(r)
-	if err != nil {
-		return err
-	}
-	for _, l := range doc.Listens {
-		song, ok := doc.Songs[l.SongID]
-		if !ok {
-			emit(ingest.ListenInput{OriginalSubmissionClient: "canto_export"})
-			continue
-		}
-
-		artistNames := make([]string, 0, len(song.ArtistIDs))
-		for _, artistID := range song.ArtistIDs {
-			if artist, ok := doc.Artists[artistID]; ok {
-				artistNames = append(artistNames, artist.Name)
-			}
-		}
-		var albumName string
-		if song.AlbumID != nil {
-			if album, ok := doc.Albums[*song.AlbumID]; ok {
-				albumName = album.Name
-			}
-		}
-		var durationMs int32
-		if song.DurationMs != nil {
-			durationMs = *song.DurationMs
-		}
-		var originURL string
-		for _, s := range song.Sources {
-			if s.RawURL != nil && *s.RawURL != "" {
-				originURL = *s.RawURL
-				break
-			}
-		}
-
-		emit(ingest.ListenInput{
-			OriginalSubmissionClient: "canto_export",
-			SubmissionClient:         l.Client,
-			OriginURL:                originURL,
-			ArtistNames:              artistNames,
-			SongName:                 song.Name,
-			AlbumName:                albumName,
-			DurationMs:               durationMs,
-			ListenedAt:               l.ListenedAt,
-		})
-	}
-	return nil
 }
 
 // decode fully decodes r as an export.Export document.

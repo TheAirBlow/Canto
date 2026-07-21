@@ -3,9 +3,13 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -20,9 +24,14 @@ import (
 	"Canto/internal/ingest"
 	"Canto/internal/logging"
 	"Canto/internal/refresh"
+	"Canto/internal/rollup"
 	"Canto/internal/search"
 	"Canto/internal/source"
+	"Canto/internal/stats"
 )
+
+// shutdownTimeout bounds how long graceful shutdown waits for in-flight HTTP requests and import jobs to wind down.
+const shutdownTimeout = 30 * time.Second
 
 // bootstrapAdminUsername/Password are the default admin account's credentials.
 const (
@@ -37,9 +46,10 @@ func main() {
 	}
 }
 
-// run initializes everything serves HTTP until the process exits.
+// run initializes everything, serves HTTP until a shutdown signal arrives, then drains cleanly.
 func run() error {
-	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
 	cfg, err := config.Load(config.DataDir)
 	if err != nil {
@@ -90,19 +100,32 @@ func run() error {
 		correlate.NewMeilisearchMatcher(searchClient),
 	)
 	engine := correlate.NewEngine(pool, searchClient)
-	service := ingest.NewService(registry, matchers, engine, queries)
 
-	importManager := importer.NewManager(pool, queries, service, cfg.Processors, cfg.Import.Workers, config.DataDir)
-	if err := importManager.RequeueStale(ctx); err != nil {
-		slog.Warn("importer: requeue stale jobs failed", "err", err)
+	// rollupWriter's ctx outlives the shutdown signal until importManager.Wait() returns.
+	rollupCtx, stopRollup := context.WithCancel(context.Background())
+	defer stopRollup()
+	rollupWriter := rollup.NewWriter(queries, cfg.Rollup.FlushInterval)
+	rollupDone := make(chan struct{})
+	go func() {
+		defer close(rollupDone)
+		rollupWriter.Run(rollupCtx)
+	}()
+
+	service := ingest.NewService(registry, matchers, engine, queries, rollupWriter)
+
+	importManager := importer.NewManager(ctx, pool, queries, service, cfg.Processors, cfg.Import.Workers, config.DataDir)
+	if err := importManager.ResumeInterruptedJobs(ctx); err != nil {
+		slog.Warn("importer: resume interrupted jobs failed", "err", err)
 	}
 
 	exportService := export.NewService(queries)
+	statsEngine := stats.NewEngine(queries, cfg.Stats.RegenInterval)
+	go statsEngine.Run(ctx)
 
 	apiServer := api.NewServer(api.Deps{
 		Queries: queries, Pool: pool, Auth: cfg.Auth, Defaults: cfg.Processors,
 		IngestDefaults: cfg.Ingest, Providers: cfg.Providers, Ingest: service,
-		Search: searchClient, Importer: importManager, Export: exportService,
+		Search: searchClient, Importer: importManager, Export: exportService, Stats: statsEngine,
 	})
 
 	refreshWorker := refresh.NewWorker(
@@ -117,8 +140,34 @@ func run() error {
 	apiServer.Register(mux)
 
 	addr := fmt.Sprintf("%s:%d", cfg.Server.BindAddr, cfg.Server.Port)
-	slog.Info("canto listening", "addr", addr)
-	return http.ListenAndServe(addr, mux)
+	srv := &http.Server{Addr: addr, Handler: mux}
+
+	serveErr := make(chan error, 1)
+	go func() {
+		slog.Info("canto listening", "addr", addr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serveErr <- err
+		}
+	}()
+
+	select {
+	case err := <-serveErr:
+		return err
+	case <-ctx.Done():
+		slog.Info("canto shutting down")
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		slog.Warn("http server shutdown failed", "err", err)
+	}
+	importManager.Wait()
+
+	stopRollup()
+	<-rollupDone
+	slog.Info("canto stopped")
+	return nil
 }
 
 // bootstrapAdmin creates the default admin/changeme account if no admin exists yet.

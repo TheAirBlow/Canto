@@ -10,6 +10,7 @@ import (
 
 	"Canto/internal/auth"
 	"Canto/internal/db"
+	"Canto/internal/rollup"
 )
 
 // registerAdmin registers admin-only endpoints.
@@ -18,6 +19,7 @@ func (s *Server) registerAdmin(mux authMux) {
 	mux.AdminAuthHandleFunc("GET /admin/invites", s.listInvites)
 	mux.AdminAuthHandleFunc("DELETE /admin/invites/{id}", s.deleteInvite)
 	mux.AdminAuthHandleFunc("POST /admin/reindex", s.reindex)
+	mux.AdminAuthHandleFunc("POST /admin/stats/recompute", s.recomputeStats)
 }
 
 // inviteResponse is the public-facing invite shape.
@@ -135,4 +137,22 @@ func (s *Server) reindex(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	write(w, http.StatusAccepted, map[string]string{"status": "reindex started"})
+}
+
+// recomputeStats kicks off a full stats rollup rebuild in the background.
+func (s *Server) recomputeStats(w http.ResponseWriter, r *http.Request) {
+	user, _ := auth.UserFromContext(r.Context())
+
+	slog.Info("admin: stats recompute started", "admin", user.Username)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel()
+		if err := rollup.RecomputeAll(ctx, s.pool, s.queries); err != nil {
+			slog.Error("admin: stats recompute failed", "err", err)
+			return
+		}
+		slog.Info("admin: stats recompute finished")
+	}()
+
+	write(w, http.StatusAccepted, map[string]string{"status": "recompute started"})
 }

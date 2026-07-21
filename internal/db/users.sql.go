@@ -7,6 +7,8 @@ package db
 
 import (
 	"context"
+
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const countAdmins = `-- name: CountAdmins :one
@@ -32,7 +34,7 @@ func (q *Queries) CountUsers(ctx context.Context) (int64, error) {
 }
 
 const createAdminUser = `-- name: CreateAdminUser :one
-INSERT INTO users (username, password_hash, is_admin) VALUES ($1, $2, TRUE) RETURNING id, username, password_hash, public_stats, is_admin, created_at
+INSERT INTO users (username, password_hash, is_admin) VALUES ($1, $2, TRUE) RETURNING id, username, password_hash, display_name, description, image_id, public, is_admin, created_at
 `
 
 type CreateAdminUserParams struct {
@@ -47,7 +49,10 @@ func (q *Queries) CreateAdminUser(ctx context.Context, arg CreateAdminUserParams
 		&i.ID,
 		&i.Username,
 		&i.PasswordHash,
-		&i.PublicStats,
+		&i.DisplayName,
+		&i.Description,
+		&i.ImageID,
+		&i.Public,
 		&i.IsAdmin,
 		&i.CreatedAt,
 	)
@@ -55,7 +60,7 @@ func (q *Queries) CreateAdminUser(ctx context.Context, arg CreateAdminUserParams
 }
 
 const createUser = `-- name: CreateUser :one
-INSERT INTO users (username, password_hash) VALUES ($1, $2) RETURNING id, username, password_hash, public_stats, is_admin, created_at
+INSERT INTO users (username, password_hash) VALUES ($1, $2) RETURNING id, username, password_hash, display_name, description, image_id, public, is_admin, created_at
 `
 
 type CreateUserParams struct {
@@ -70,7 +75,10 @@ func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (User, e
 		&i.ID,
 		&i.Username,
 		&i.PasswordHash,
-		&i.PublicStats,
+		&i.DisplayName,
+		&i.Description,
+		&i.ImageID,
+		&i.Public,
 		&i.IsAdmin,
 		&i.CreatedAt,
 	)
@@ -78,7 +86,7 @@ func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (User, e
 }
 
 const getUserByID = `-- name: GetUserByID :one
-SELECT id, username, password_hash, public_stats, is_admin, created_at FROM users WHERE id = $1
+SELECT id, username, password_hash, display_name, description, image_id, public, is_admin, created_at FROM users WHERE id = $1
 `
 
 func (q *Queries) GetUserByID(ctx context.Context, id int64) (User, error) {
@@ -88,7 +96,10 @@ func (q *Queries) GetUserByID(ctx context.Context, id int64) (User, error) {
 		&i.ID,
 		&i.Username,
 		&i.PasswordHash,
-		&i.PublicStats,
+		&i.DisplayName,
+		&i.Description,
+		&i.ImageID,
+		&i.Public,
 		&i.IsAdmin,
 		&i.CreatedAt,
 	)
@@ -96,7 +107,7 @@ func (q *Queries) GetUserByID(ctx context.Context, id int64) (User, error) {
 }
 
 const getUserByUsername = `-- name: GetUserByUsername :one
-SELECT id, username, password_hash, public_stats, is_admin, created_at FROM users WHERE username = $1
+SELECT id, username, password_hash, display_name, description, image_id, public, is_admin, created_at FROM users WHERE username = $1
 `
 
 func (q *Queries) GetUserByUsername(ctx context.Context, username string) (User, error) {
@@ -106,7 +117,142 @@ func (q *Queries) GetUserByUsername(ctx context.Context, username string) (User,
 		&i.ID,
 		&i.Username,
 		&i.PasswordHash,
-		&i.PublicStats,
+		&i.DisplayName,
+		&i.Description,
+		&i.ImageID,
+		&i.Public,
+		&i.IsAdmin,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const getUsersByIDs = `-- name: GetUsersByIDs :many
+SELECT id, username, password_hash, display_name, description, image_id, public, is_admin, created_at FROM users WHERE id = ANY($1::bigint[])
+`
+
+func (q *Queries) GetUsersByIDs(ctx context.Context, ids []int64) ([]User, error) {
+	rows, err := q.db.Query(ctx, getUsersByIDs, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []User
+	for rows.Next() {
+		var i User
+		if err := rows.Scan(
+			&i.ID,
+			&i.Username,
+			&i.PasswordHash,
+			&i.DisplayName,
+			&i.Description,
+			&i.ImageID,
+			&i.Public,
+			&i.IsAdmin,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listPublicUsers = `-- name: ListPublicUsers :many
+SELECT id, username, password_hash, display_name, description, image_id, public, is_admin, created_at FROM users WHERE public AND id > $1::bigint ORDER BY id LIMIT $2::int
+`
+
+type ListPublicUsersParams struct {
+	After   int64 `json:"after"`
+	MaxRows int32 `json:"max_rows"`
+}
+
+func (q *Queries) ListPublicUsers(ctx context.Context, arg ListPublicUsersParams) ([]User, error) {
+	rows, err := q.db.Query(ctx, listPublicUsers, arg.After, arg.MaxRows)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []User
+	for rows.Next() {
+		var i User
+		if err := rows.Scan(
+			&i.ID,
+			&i.Username,
+			&i.PasswordHash,
+			&i.DisplayName,
+			&i.Description,
+			&i.ImageID,
+			&i.Public,
+			&i.IsAdmin,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const setUserImage = `-- name: SetUserImage :one
+UPDATE users SET image_id = $2 WHERE id = $1 RETURNING id, username, password_hash, display_name, description, image_id, public, is_admin, created_at
+`
+
+type SetUserImageParams struct {
+	ID      int64       `json:"id"`
+	ImageID pgtype.UUID `json:"image_id"`
+}
+
+func (q *Queries) SetUserImage(ctx context.Context, arg SetUserImageParams) (User, error) {
+	row := q.db.QueryRow(ctx, setUserImage, arg.ID, arg.ImageID)
+	var i User
+	err := row.Scan(
+		&i.ID,
+		&i.Username,
+		&i.PasswordHash,
+		&i.DisplayName,
+		&i.Description,
+		&i.ImageID,
+		&i.Public,
+		&i.IsAdmin,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const updateUserProfile = `-- name: UpdateUserProfile :one
+UPDATE users SET display_name = $2, description = $3, public = $4 WHERE id = $1 RETURNING id, username, password_hash, display_name, description, image_id, public, is_admin, created_at
+`
+
+type UpdateUserProfileParams struct {
+	ID          int64   `json:"id"`
+	DisplayName *string `json:"display_name"`
+	Description *string `json:"description"`
+	Public      bool    `json:"public"`
+}
+
+func (q *Queries) UpdateUserProfile(ctx context.Context, arg UpdateUserProfileParams) (User, error) {
+	row := q.db.QueryRow(ctx, updateUserProfile,
+		arg.ID,
+		arg.DisplayName,
+		arg.Description,
+		arg.Public,
+	)
+	var i User
+	err := row.Scan(
+		&i.ID,
+		&i.Username,
+		&i.PasswordHash,
+		&i.DisplayName,
+		&i.Description,
+		&i.ImageID,
+		&i.Public,
 		&i.IsAdmin,
 		&i.CreatedAt,
 	)

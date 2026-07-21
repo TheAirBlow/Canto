@@ -1,11 +1,11 @@
 package importer
 
 import (
+	"context"
 	"io"
 	"strings"
 	"time"
 
-	"Canto/internal/db"
 	"Canto/internal/ingest"
 )
 
@@ -16,34 +16,29 @@ type ytmusicFormat struct{}
 func newYTMusicFormat() Format { return ytmusicFormat{} }
 
 // ID identifies this format's import_service discriminator.
-func (ytmusicFormat) ID() db.ImportService { return db.ImportServiceYtmusic }
+func (ytmusicFormat) ID() ImportService { return ImportServiceYtmusic }
 
-// ytmusicEntry is one entry in a YouTube Music Takeout watch-history export.
+// ytmusicEntry is one entry in a YouTube Takeout watch-history export.
 type ytmusicEntry struct {
+	Header   string `json:"header"`
 	Title    string `json:"title"`
 	TitleURL string `json:"titleUrl"`
 	Time     string `json:"time"`
 }
 
-// CountEntries does a cheap structural scan of r for the raw top-level entry count.
-func (ytmusicFormat) CountEntries(r io.Reader) (int, error) {
-	return countJSONArray(r)
-}
-
-// Parse streams r, calling emit once per raw top-level entry.
-func (ytmusicFormat) Parse(r io.Reader, emit func(ingest.ListenInput)) error {
-	return decodeJSONArray(r, func(e ytmusicEntry) {
-		if e.TitleURL == "" {
-			emit(ingest.ListenInput{OriginalSubmissionClient: "ytmusic_takeout"})
-			return
+// Parse returns r's total entry count immediately, then streams entries from startIdx onward to out in the background.
+func (ytmusicFormat) Parse(ctx context.Context, r io.Reader, out chan<- ingest.ListenInput, startIdx int) (int, error) {
+	return parseJSONArray(ctx, r, out, startIdx, func(e ytmusicEntry) ingest.ListenInput {
+		if e.TitleURL == "" || e.Header == "YouTube" {
+			return ingest.ListenInput{OriginalSubmissionClient: "ytmusic_takeout"}
 		}
 		listenedAt, _ := time.Parse(time.RFC3339, e.Time)
 
-		emit(ingest.ListenInput{
+		return ingest.ListenInput{
 			OriginalSubmissionClient: "ytmusic_takeout",
 			OriginURL:                e.TitleURL,
 			SongName:                 strings.TrimPrefix(e.Title, "Watched "),
 			ListenedAt:               listenedAt,
-		})
+		}
 	})
 }

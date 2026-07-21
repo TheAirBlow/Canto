@@ -1,12 +1,12 @@
 package importer
 
 import (
+	"context"
 	"encoding/csv"
 	"io"
 	"strconv"
 	"time"
 
-	"Canto/internal/db"
 	"Canto/internal/ingest"
 )
 
@@ -17,51 +17,49 @@ type lastFMFormat struct{}
 func newLastFMFormat() Format { return lastFMFormat{} }
 
 // ID identifies this format's import_service discriminator.
-func (lastFMFormat) ID() db.ImportService { return db.ImportServiceLastfm }
+func (lastFMFormat) ID() ImportService { return ImportServiceLastfm }
 
-// CountEntries does a cheap structural scan of r for the raw top-level entry count.
-func (f lastFMFormat) CountEntries(r io.Reader) (int, error) {
-	rows, err := csv.NewReader(r).ReadAll()
+// Parse returns r's total row count immediately, then streams entries from startIdx onward to out in the background.
+func (f lastFMFormat) Parse(ctx context.Context, r io.Reader, out chan<- ingest.ListenInput, startIdx int) (int, error) {
+	cr := csv.NewReader(r)
+	cr.FieldsPerRecord = -1
+	records, err := cr.ReadAll()
 	if err != nil {
 		return 0, err
 	}
-	return len(rows), nil
-}
 
-// Parse streams r, calling emit once per raw top-level entry.
-func (f lastFMFormat) Parse(r io.Reader, emit func(ingest.ListenInput)) error {
-	cr := csv.NewReader(r)
-	cr.FieldsPerRecord = -1
+	go func() {
+		defer close(out)
+		for i := startIdx; i < len(records); i++ {
+			record := records[i]
+			var entry ingest.ListenInput
+			if len(record) < 4 {
+				entry = ingest.ListenInput{OriginalSubmissionClient: "lastfm_export"}
+			} else {
+				artist, album, track, timestamp := record[0], record[1], record[2], record[3]
+				var listenedAt time.Time
+				if unix, err := strconv.ParseInt(timestamp, 10, 64); err == nil {
+					listenedAt = time.Unix(unix, 0).UTC()
+				}
+				var artists []string
+				if artist != "" {
+					artists = []string{artist}
+				}
+				entry = ingest.ListenInput{
+					OriginalSubmissionClient: "lastfm_export",
+					ArtistNames:              artists,
+					SongName:                 track,
+					AlbumName:                album,
+					ListenedAt:               listenedAt,
+				}
+			}
 
-	for {
-		record, err := cr.Read()
-		if err == io.EOF {
-			return nil
+			select {
+			case out <- entry:
+			case <-ctx.Done():
+				return
+			}
 		}
-		if err != nil {
-			return err
-		}
-		if len(record) < 4 {
-			emit(ingest.ListenInput{OriginalSubmissionClient: "lastfm_export"})
-			continue
-		}
-
-		artist, album, track, timestamp := record[0], record[1], record[2], record[3]
-		var listenedAt time.Time
-		if unix, err := strconv.ParseInt(timestamp, 10, 64); err == nil {
-			listenedAt = time.Unix(unix, 0).UTC()
-		}
-
-		var artists []string
-		if artist != "" {
-			artists = []string{artist}
-		}
-		emit(ingest.ListenInput{
-			OriginalSubmissionClient: "lastfm_export",
-			ArtistNames:              artists,
-			SongName:                 track,
-			AlbumName:                album,
-			ListenedAt:               listenedAt,
-		})
-	}
+	}()
+	return len(records), nil
 }

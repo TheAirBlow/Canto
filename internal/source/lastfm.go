@@ -8,8 +8,6 @@ import (
 	"net/url"
 	"strconv"
 	"time"
-
-	"Canto/internal/db"
 )
 
 // lastFMProcessor looks up track metadata from Last.fm by artist/song text.
@@ -156,4 +154,4 @@ func (p *lastFMProcessor) State(context.Context) State {
 }
 
 // Type identifies this processor's source_type.
-func (p *lastFMProcessor) Type() db.SourceType { return db.SourceTypeLastfm }
+func (p *lastFMProcessor) Type() SourceType { return SourceTypeLastfm }

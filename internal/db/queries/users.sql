@@ -15,3 +15,15 @@ SELECT count(*) FROM users;
 
 -- name: CountAdmins :one
 SELECT count(*) FROM users WHERE is_admin = TRUE;
+
+-- name: GetUsersByIDs :many
+SELECT * FROM users WHERE id = ANY(sqlc.arg(ids)::bigint[]);
+
+-- name: ListPublicUsers :many
+SELECT * FROM users WHERE public AND id > sqlc.arg(after)::bigint ORDER BY id LIMIT sqlc.arg(max_rows)::int;
+
+-- name: UpdateUserProfile :one
+UPDATE users SET display_name = $2, description = $3, public = $4 WHERE id = $1 RETURNING *;
+
+-- name: SetUserImage :one
+UPDATE users SET image_id = $2 WHERE id = $1 RETURNING *;

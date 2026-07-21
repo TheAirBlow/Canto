@@ -4,6 +4,8 @@ package importer
 import (
 	"context"
 	"log/slog"
+	"os"
+	"sync"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -14,32 +16,50 @@ import (
 
 // Manager owns the shared import worker pool and per-format parsers.
 type Manager struct {
+	ctx      context.Context // canceled on graceful shutdown; every running job watches it to pause cleanly
+	wg       sync.WaitGroup  // tracks in-flight runJob calls, so shutdown can wait for them to pause/finish
 	dbPool   *pgxpool.Pool
 	queries  *db.Queries
 	ingest   *ingest.Service
 	defaults config.ProcessorsConfig
 	sem      chan struct{}
 	dataDir  string
-	formats  map[db.ImportService]Format
+	formats  map[ImportService]Format
 }
 
-// NewManager builds a Manager backed by queries/ingestService, with a shared pool sized workers.
-func NewManager(dbPool *pgxpool.Pool, queries *db.Queries, ingestService *ingest.Service, defaults config.ProcessorsConfig, workers int, dataDir string) *Manager {
+// NewManager builds a Manager backed by queries/ingestService, with a shared pool sized workers; canceling ctx signals every running job to pause rather than abort mid-write.
+func NewManager(ctx context.Context, dbPool *pgxpool.Pool, queries *db.Queries, ingestService *ingest.Service, defaults config.ProcessorsConfig, workers int, dataDir string) *Manager {
 	return &Manager{
-		dbPool: dbPool, queries: queries, ingest: ingestService, defaults: defaults,
+		ctx: ctx, dbPool: dbPool, queries: queries, ingest: ingestService, defaults: defaults,
 		sem: make(chan struct{}, workers), dataDir: dataDir, formats: defaultFormats(),
 	}
 }
 
-// RequeueStale resets any job left "running" by a previous crash back to "queued", and resumes it.
-func (m *Manager) RequeueStale(ctx context.Context) error {
-	jobs, err := m.queries.ResetStaleRunningImportJobs(ctx)
+// Wait blocks until every in-flight import job has paused or finished; call during shutdown so the process doesn't exit mid-pause.
+func (m *Manager) Wait() {
+	m.wg.Wait()
+}
+
+// ResumeInterruptedJobs fails+deletes any job still "running" (an unclean shutdown, so its progress can't be trusted) and resumes every "queued" or "paused" job from its last recorded progress.
+func (m *Manager) ResumeInterruptedJobs(ctx context.Context) error {
+	interrupted, err := m.queries.FailInterruptedImportJobs(ctx)
 	if err != nil {
 		return err
 	}
-	for _, job := range jobs {
-		slog.Warn("importer: requeuing stale running job", "id", job.ID)
-		m.runAsync(job)
+	for _, job := range interrupted {
+		slog.Warn("importer: job was running during a previous shutdown, marking failed", "id", job.ID)
+		if err := os.Remove(m.finalPath(job.ID, job.Filename)); err != nil && !os.IsNotExist(err) {
+			slog.Warn("importer: remove file for failed job failed", "id", job.ID, "err", err)
+		}
+	}
+
+	resumable, err := m.queries.ListResumableImportJobs(ctx)
+	if err != nil {
+		return err
+	}
+	for _, job := range resumable {
+		slog.Info("importer: resuming job", "id", job.ID, "from", job.ProcessedItems)
+		m.runAsync(job, int(job.ProcessedItems))
 	}
 	return nil
 }

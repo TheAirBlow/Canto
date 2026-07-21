@@ -53,7 +53,7 @@ func (q *Queries) DeleteSession(ctx context.Context, tokenHash string) error {
 }
 
 const getSessionUser = `-- name: GetSessionUser :one
-SELECT users.id, users.username, users.password_hash, users.public_stats, users.is_admin, users.created_at, sessions.expires_at AS session_expires_at FROM sessions
+SELECT users.id, users.username, users.password_hash, users.display_name, users.description, users.image_id, users.public, users.is_admin, users.created_at, sessions.expires_at AS session_expires_at FROM sessions
 JOIN users ON users.id = sessions.user_id
 WHERE sessions.token_hash = $1
 `
@@ -62,7 +62,10 @@ type GetSessionUserRow struct {
 	ID               int64              `json:"id"`
 	Username         string             `json:"username"`
 	PasswordHash     string             `json:"password_hash"`
-	PublicStats      bool               `json:"public_stats"`
+	DisplayName      *string            `json:"display_name"`
+	Description      *string            `json:"description"`
+	ImageID          pgtype.UUID        `json:"image_id"`
+	Public           bool               `json:"public"`
 	IsAdmin          bool               `json:"is_admin"`
 	CreatedAt        pgtype.Timestamptz `json:"created_at"`
 	SessionExpiresAt pgtype.Timestamptz `json:"session_expires_at"`
@@ -75,7 +78,10 @@ func (q *Queries) GetSessionUser(ctx context.Context, tokenHash string) (GetSess
 		&i.ID,
 		&i.Username,
 		&i.PasswordHash,
-		&i.PublicStats,
+		&i.DisplayName,
+		&i.Description,
+		&i.ImageID,
+		&i.Public,
 		&i.IsAdmin,
 		&i.CreatedAt,
 		&i.SessionExpiresAt,

@@ -12,8 +12,6 @@ import (
 	"time"
 
 	"golang.org/x/time/rate"
-
-	"Canto/internal/db"
 )
 
 // mbidPattern matches a MusicBrainz recording page URL, capturing the MBID.
@@ -225,7 +223,7 @@ func (p *musicBrainzProcessor) State(context.Context) State {
 }
 
 // Type identifies this processor's source_type.
-func (p *musicBrainzProcessor) Type() db.SourceType { return db.SourceTypeMusicbrainz }
+func (p *musicBrainzProcessor) Type() SourceType { return SourceTypeMusicbrainz }
 
 // get performs a rate-limited GET request against reqURL and decodes the JSON response into out.
 func (p *musicBrainzProcessor) get(ctx context.Context, reqURL string, out any) error {

@@ -13,8 +13,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"Canto/internal/db"
 )
 
 // ytmSongsFilterParam restricts a YTM search to the "Songs" category.
@@ -316,10 +314,6 @@ func (p *youtubeProcessor) FetchAlbum(ctx context.Context, id string) (AlbumMeta
 			continue
 		}
 
-		// The shelf's play button videoId is just a per-context playlist copy, and often differs from
-		// the track's actual canonical videoId (the same one search/FetchMetadata would return for
-		// it). The "View song credits" menu entry (browseId "MPTC<videoId>") reliably points at that
-		// canonical id instead, so prefer it when present.
 		videoID := playedVideoID
 		menuItems, _ := navSlice(item, "menu", "menuRenderer", "items")
 		for _, menuItemRaw := range menuItems {
@@ -412,7 +406,7 @@ func (p *youtubeProcessor) State(context.Context) State {
 }
 
 // Type identifies this processor's source_type.
-func (p *youtubeProcessor) Type() db.SourceType { return db.SourceTypeYtmusic }
+func (p *youtubeProcessor) Type() SourceType { return SourceTypeYtmusic }
 
 // toSeconds converts a "m:ss" or "h:mm:ss" duration run into whole seconds.
 func toSeconds(text string) int32 {

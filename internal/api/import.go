@@ -47,7 +47,7 @@ func newImportJobResponse(j db.ImportJob) importJobResponse {
 		batchID = uuid.UUID(j.BatchID.Bytes).String()
 	}
 	resp := importJobResponse{
-		ID: j.ID, BatchID: batchID, Filename: j.Filename, Service: string(j.Service), Status: string(j.Status),
+		ID: j.ID, BatchID: batchID, Filename: j.Filename, Service: j.Service, Status: string(j.Status),
 		TotalItems: j.TotalItems, ProcessedItems: j.ProcessedItems, ImportedItems: j.ImportedItems,
 		SkippedItems: j.SkippedItems, FailedItems: j.FailedItems, ErrorMessage: j.ErrorMessage, CreatedAt: j.CreatedAt.Time,
 	}
@@ -92,7 +92,7 @@ func (s *Server) createImportBatch(w http.ResponseWriter, r *http.Request) {
 		files = append(files, importer.UploadedFile{Filename: fh.Filename, Reader: f})
 	}
 
-	jobs, err := s.importer.CreateBatch(r.Context(), user.ID, db.ImportService(service), files)
+	jobs, err := s.importer.CreateBatch(r.Context(), user.ID, importer.ImportService(service), files)
 	if err != nil {
 		badRequest(w, err.Error())
 		return

@@ -97,57 +97,12 @@ func (ns NullEntityType) Value() (driver.Value, error) {
 	return string(ns.EntityType), nil
 }
 
-type ImportService string
-
-const (
-	ImportServiceSpotify      ImportService = "spotify"
-	ImportServiceYtmusic      ImportService = "ytmusic"
-	ImportServiceLastfm       ImportService = "lastfm"
-	ImportServiceListenbrainz ImportService = "listenbrainz"
-	ImportServiceMaloja       ImportService = "maloja"
-	ImportServiceCantoExport  ImportService = "canto_export"
-)
-
-func (e *ImportService) Scan(src interface{}) error {
-	switch s := src.(type) {
-	case []byte:
-		*e = ImportService(s)
-	case string:
-		*e = ImportService(s)
-	default:
-		return fmt.Errorf("unsupported scan type for ImportService: %T", src)
-	}
-	return nil
-}
-
-type NullImportService struct {
-	ImportService ImportService `json:"import_service"`
-	Valid         bool          `json:"valid"` // Valid is true if ImportService is not NULL
-}
-
-// Scan implements the Scanner interface.
-func (ns *NullImportService) Scan(value interface{}) error {
-	if value == nil {
-		ns.ImportService, ns.Valid = "", false
-		return nil
-	}
-	ns.Valid = true
-	return ns.ImportService.Scan(value)
-}
-
-// Value implements the driver Valuer interface.
-func (ns NullImportService) Value() (driver.Value, error) {
-	if !ns.Valid {
-		return nil, nil
-	}
-	return string(ns.ImportService), nil
-}
-
 type ImportStatus string
 
 const (
 	ImportStatusQueued    ImportStatus = "queued"
 	ImportStatusRunning   ImportStatus = "running"
+	ImportStatusPaused    ImportStatus = "paused"
 	ImportStatusCompleted ImportStatus = "completed"
 	ImportStatusFailed    ImportStatus = "failed"
 	ImportStatusCancelled ImportStatus = "cancelled"
@@ -188,52 +143,54 @@ func (ns NullImportStatus) Value() (driver.Value, error) {
 	return string(ns.ImportStatus), nil
 }
 
-type SourceType string
+type StatsResource string
 
 const (
-	SourceTypeYtmusic     SourceType = "ytmusic"
-	SourceTypeSpotify     SourceType = "spotify"
-	SourceTypeBandcamp    SourceType = "bandcamp"
-	SourceTypeMusicbrainz SourceType = "musicbrainz"
-	SourceTypeLastfm      SourceType = "lastfm"
-	SourceTypeDeezer      SourceType = "deezer"
-	SourceTypeSubsonic    SourceType = "subsonic"
-	SourceTypeUnknown     SourceType = "unknown"
+	StatsResourceSummary    StatsResource = "summary"
+	StatsResourceTopArtists StatsResource = "top_artists"
+	StatsResourceTopAlbums  StatsResource = "top_albums"
+	StatsResourceTopTracks  StatsResource = "top_tracks"
+	StatsResourceActivity   StatsResource = "activity"
+	StatsResourceInterest   StatsResource = "interest"
+	StatsResourceClock      StatsResource = "clock"
+	StatsResourceSources    StatsResource = "sources"
+	StatsResourceDiscovery  StatsResource = "discovery"
+	StatsResourceRewind     StatsResource = "rewind"
 )
 
-func (e *SourceType) Scan(src interface{}) error {
+func (e *StatsResource) Scan(src interface{}) error {
 	switch s := src.(type) {
 	case []byte:
-		*e = SourceType(s)
+		*e = StatsResource(s)
 	case string:
-		*e = SourceType(s)
+		*e = StatsResource(s)
 	default:
-		return fmt.Errorf("unsupported scan type for SourceType: %T", src)
+		return fmt.Errorf("unsupported scan type for StatsResource: %T", src)
 	}
 	return nil
 }
 
-type NullSourceType struct {
-	SourceType SourceType `json:"source_type"`
-	Valid      bool       `json:"valid"` // Valid is true if SourceType is not NULL
+type NullStatsResource struct {
+	StatsResource StatsResource `json:"stats_resource"`
+	Valid         bool          `json:"valid"` // Valid is true if StatsResource is not NULL
 }
 
 // Scan implements the Scanner interface.
-func (ns *NullSourceType) Scan(value interface{}) error {
+func (ns *NullStatsResource) Scan(value interface{}) error {
 	if value == nil {
-		ns.SourceType, ns.Valid = "", false
+		ns.StatsResource, ns.Valid = "", false
 		return nil
 	}
 	ns.Valid = true
-	return ns.SourceType.Scan(value)
+	return ns.StatsResource.Scan(value)
 }
 
 // Value implements the driver Valuer interface.
-func (ns NullSourceType) Value() (driver.Value, error) {
+func (ns NullStatsResource) Value() (driver.Value, error) {
 	if !ns.Valid {
 		return nil, nil
 	}
-	return string(ns.SourceType), nil
+	return string(ns.StatsResource), nil
 }
 
 type Album struct {
@@ -280,6 +237,21 @@ type ArtistBlacklist struct {
 	CreatedAt pgtype.Timestamptz `json:"created_at"`
 }
 
+type ClockCell struct {
+	UserID      int64       `json:"user_id"`
+	Day         pgtype.Date `json:"day"`
+	Hour        int16       `json:"hour"`
+	ListenCount int32       `json:"listen_count"`
+}
+
+type DailySongListen struct {
+	UserID      int64       `json:"user_id"`
+	SongID      int64       `json:"song_id"`
+	Day         pgtype.Date `json:"day"`
+	ListenCount int32       `json:"listen_count"`
+	MinutesMs   int64       `json:"minutes_ms"`
+}
+
 type EntityAlias struct {
 	ID         int64              `json:"id"`
 	EntityType EntityType         `json:"entity_type"`
@@ -288,12 +260,20 @@ type EntityAlias struct {
 	CreatedAt  pgtype.Timestamptz `json:"created_at"`
 }
 
+type EntityGlobalStat struct {
+	EntityType      EntityType         `json:"entity_type"`
+	EntityID        int64              `json:"entity_id"`
+	Plays           int32              `json:"plays"`
+	UniqueListeners int32              `json:"unique_listeners"`
+	FirstListenedAt pgtype.Timestamptz `json:"first_listened_at"`
+}
+
 type ImportJob struct {
 	ID             int64              `json:"id"`
 	UserID         int64              `json:"user_id"`
 	BatchID        pgtype.UUID        `json:"batch_id"`
 	Filename       string             `json:"filename"`
-	Service        ImportService      `json:"service"`
+	Service        string             `json:"service"`
 	Status         ImportStatus       `json:"status"`
 	TotalItems     int32              `json:"total_items"`
 	ProcessedItems int32              `json:"processed_items"`
@@ -369,7 +349,7 @@ type Source struct {
 	ID                int64              `json:"id"`
 	EntityType        EntityType         `json:"entity_type"`
 	EntityID          int64              `json:"entity_id"`
-	SourceType        SourceType         `json:"source_type"`
+	SourceType        string             `json:"source_type"`
 	RawUrl            *string            `json:"raw_url"`
 	ExtractedID       *string            `json:"extracted_id"`
 	CorrelationMethod CorrelationMethod  `json:"correlation_method"`
@@ -377,13 +357,42 @@ type Source struct {
 	CreatedAt         pgtype.Timestamptz `json:"created_at"`
 }
 
+type StatsCache struct {
+	ID         int64              `json:"id"`
+	UserID     *int64             `json:"user_id"`
+	ArtistID   *int64             `json:"artist_id"`
+	AlbumID    *int64             `json:"album_id"`
+	SongID     *int64             `json:"song_id"`
+	Resource   StatsResource      `json:"resource"`
+	Params     []byte             `json:"params"`
+	Data       []byte             `json:"data"`
+	ComputedAt pgtype.Timestamptz `json:"computed_at"`
+}
+
 type User struct {
 	ID           int64              `json:"id"`
 	Username     string             `json:"username"`
 	PasswordHash string             `json:"password_hash"`
-	PublicStats  bool               `json:"public_stats"`
+	DisplayName  *string            `json:"display_name"`
+	Description  *string            `json:"description"`
+	ImageID      pgtype.UUID        `json:"image_id"`
+	Public       bool               `json:"public"`
 	IsAdmin      bool               `json:"is_admin"`
 	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+}
+
+type UserEntityFirstListen struct {
+	UserID     int64              `json:"user_id"`
+	EntityType EntityType         `json:"entity_type"`
+	EntityID   int64              `json:"entity_id"`
+	FirstAt    pgtype.Timestamptz `json:"first_at"`
+}
+
+type UserListenState struct {
+	UserID         int64              `json:"user_id"`
+	LastListenedAt pgtype.Timestamptz `json:"last_listened_at"`
+	CurrentStreak  int32              `json:"current_streak"`
+	LongestStreak  int32              `json:"longest_streak"`
 }
 
 type UserSetting struct {

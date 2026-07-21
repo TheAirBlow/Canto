@@ -113,7 +113,10 @@ func (s *Server) authenticateCookie(r *http.Request) (db.User, error) {
 		ID:           row.ID,
 		Username:     row.Username,
 		PasswordHash: row.PasswordHash,
-		PublicStats:  row.PublicStats,
+		DisplayName:  row.DisplayName,
+		Description:  row.Description,
+		ImageID:      row.ImageID,
+		Public:       row.Public,
 		IsAdmin:      row.IsAdmin,
 		CreatedAt:    row.CreatedAt,
 	}, nil

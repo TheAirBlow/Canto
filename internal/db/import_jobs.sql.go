@@ -13,7 +13,7 @@ import (
 
 const cancelImportJob = `-- name: CancelImportJob :execrows
 UPDATE import_jobs SET status = 'cancelled', finished_at = now()
-WHERE id = $1 AND user_id = $2 AND status IN ('queued', 'running')
+WHERE id = $1 AND user_id = $2 AND status IN ('queued', 'running', 'paused')
 `
 
 type CancelImportJobParams struct {
@@ -35,11 +35,11 @@ VALUES ($1, $2, $3, $4, $5) RETURNING id, user_id, batch_id, filename, service, 
 `
 
 type CreateImportJobParams struct {
-	UserID     int64         `json:"user_id"`
-	BatchID    pgtype.UUID   `json:"batch_id"`
-	Filename   string        `json:"filename"`
-	Service    ImportService `json:"service"`
-	TotalItems int32         `json:"total_items"`
+	UserID     int64       `json:"user_id"`
+	BatchID    pgtype.UUID `json:"batch_id"`
+	Filename   string      `json:"filename"`
+	Service    string      `json:"service"`
+	TotalItems int32       `json:"total_items"`
 }
 
 func (q *Queries) CreateImportJob(ctx context.Context, arg CreateImportJobParams) (ImportJob, error) {
@@ -69,6 +69,49 @@ func (q *Queries) CreateImportJob(ctx context.Context, arg CreateImportJobParams
 		&i.FinishedAt,
 	)
 	return i, err
+}
+
+const failInterruptedImportJobs = `-- name: FailInterruptedImportJobs :many
+UPDATE import_jobs SET status = 'failed',
+  error_message = 'server restarted while this job was running; progress could not be verified',
+  finished_at = now()
+WHERE status = 'running' RETURNING id, user_id, batch_id, filename, service, status, total_items, processed_items, imported_items, skipped_items, failed_items, error_message, created_at, started_at, finished_at
+`
+
+func (q *Queries) FailInterruptedImportJobs(ctx context.Context) ([]ImportJob, error) {
+	rows, err := q.db.Query(ctx, failInterruptedImportJobs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ImportJob
+	for rows.Next() {
+		var i ImportJob
+		if err := rows.Scan(
+			&i.ID,
+			&i.UserID,
+			&i.BatchID,
+			&i.Filename,
+			&i.Service,
+			&i.Status,
+			&i.TotalItems,
+			&i.ProcessedItems,
+			&i.ImportedItems,
+			&i.SkippedItems,
+			&i.FailedItems,
+			&i.ErrorMessage,
+			&i.CreatedAt,
+			&i.StartedAt,
+			&i.FinishedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const finishImportJob = `-- name: FinishImportJob :exec
@@ -211,12 +254,12 @@ func (q *Queries) ListImportJobsForUser(ctx context.Context, userID int64) ([]Im
 	return items, nil
 }
 
-const resetStaleRunningImportJobs = `-- name: ResetStaleRunningImportJobs :many
-UPDATE import_jobs SET status = 'queued', started_at = NULL WHERE status = 'running' RETURNING id, user_id, batch_id, filename, service, status, total_items, processed_items, imported_items, skipped_items, failed_items, error_message, created_at, started_at, finished_at
+const listResumableImportJobs = `-- name: ListResumableImportJobs :many
+SELECT id, user_id, batch_id, filename, service, status, total_items, processed_items, imported_items, skipped_items, failed_items, error_message, created_at, started_at, finished_at FROM import_jobs WHERE status IN ('queued', 'paused') ORDER BY created_at
 `
 
-func (q *Queries) ResetStaleRunningImportJobs(ctx context.Context) ([]ImportJob, error) {
-	rows, err := q.db.Query(ctx, resetStaleRunningImportJobs)
+func (q *Queries) ListResumableImportJobs(ctx context.Context) ([]ImportJob, error) {
+	rows, err := q.db.Query(ctx, listResumableImportJobs)
 	if err != nil {
 		return nil, err
 	}
@@ -249,6 +292,29 @@ func (q *Queries) ResetStaleRunningImportJobs(ctx context.Context) ([]ImportJob,
 		return nil, err
 	}
 	return items, nil
+}
+
+const pauseImportJob = `-- name: PauseImportJob :exec
+UPDATE import_jobs SET status = 'paused' WHERE id = $1
+`
+
+func (q *Queries) PauseImportJob(ctx context.Context, id int64) error {
+	_, err := q.db.Exec(ctx, pauseImportJob, id)
+	return err
+}
+
+const setImportJobTotal = `-- name: SetImportJobTotal :exec
+UPDATE import_jobs SET total_items = $2 WHERE id = $1
+`
+
+type SetImportJobTotalParams struct {
+	ID         int64 `json:"id"`
+	TotalItems int32 `json:"total_items"`
+}
+
+func (q *Queries) SetImportJobTotal(ctx context.Context, arg SetImportJobTotalParams) error {
+	_, err := q.db.Exec(ctx, setImportJobTotal, arg.ID, arg.TotalItems)
+	return err
 }
 
 const startImportJob = `-- name: StartImportJob :exec

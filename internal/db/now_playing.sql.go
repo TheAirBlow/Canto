@@ -7,6 +7,8 @@ package db
 
 import (
 	"context"
+
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const deleteAllNowPlaying = `-- name: DeleteAllNowPlaying :exec
@@ -34,6 +36,145 @@ func (q *Queries) GetNowPlaying(ctx context.Context, userID int64) (NowPlaying, 
 		&i.DurationMs,
 	)
 	return i, err
+}
+
+const listNowPlayingForAlbum = `-- name: ListNowPlayingForAlbum :many
+SELECT np.song_id, np.started_at, np.duration_ms, u.id AS user_id, u.username, u.display_name, u.image_id AS user_image_id
+FROM now_playing np
+JOIN song_albums sa ON sa.song_id = np.song_id
+JOIN users u ON u.id = np.user_id
+WHERE sa.album_id = $1::bigint AND u.public
+  AND np.started_at + (COALESCE(np.duration_ms, 0) || ' milliseconds')::interval >= now()
+`
+
+type ListNowPlayingForAlbumRow struct {
+	SongID      int64              `json:"song_id"`
+	StartedAt   pgtype.Timestamptz `json:"started_at"`
+	DurationMs  *int32             `json:"duration_ms"`
+	UserID      int64              `json:"user_id"`
+	Username    string             `json:"username"`
+	DisplayName *string            `json:"display_name"`
+	UserImageID pgtype.UUID        `json:"user_image_id"`
+}
+
+func (q *Queries) ListNowPlayingForAlbum(ctx context.Context, albumID int64) ([]ListNowPlayingForAlbumRow, error) {
+	rows, err := q.db.Query(ctx, listNowPlayingForAlbum, albumID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListNowPlayingForAlbumRow
+	for rows.Next() {
+		var i ListNowPlayingForAlbumRow
+		if err := rows.Scan(
+			&i.SongID,
+			&i.StartedAt,
+			&i.DurationMs,
+			&i.UserID,
+			&i.Username,
+			&i.DisplayName,
+			&i.UserImageID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listNowPlayingForArtist = `-- name: ListNowPlayingForArtist :many
+SELECT np.song_id, np.started_at, np.duration_ms, u.id AS user_id, u.username, u.display_name, u.image_id AS user_image_id
+FROM now_playing np
+JOIN song_artists sar ON sar.song_id = np.song_id
+JOIN users u ON u.id = np.user_id
+WHERE sar.artist_id = $1::bigint AND u.public
+  AND np.started_at + (COALESCE(np.duration_ms, 0) || ' milliseconds')::interval >= now()
+`
+
+type ListNowPlayingForArtistRow struct {
+	SongID      int64              `json:"song_id"`
+	StartedAt   pgtype.Timestamptz `json:"started_at"`
+	DurationMs  *int32             `json:"duration_ms"`
+	UserID      int64              `json:"user_id"`
+	Username    string             `json:"username"`
+	DisplayName *string            `json:"display_name"`
+	UserImageID pgtype.UUID        `json:"user_image_id"`
+}
+
+func (q *Queries) ListNowPlayingForArtist(ctx context.Context, artistID int64) ([]ListNowPlayingForArtistRow, error) {
+	rows, err := q.db.Query(ctx, listNowPlayingForArtist, artistID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListNowPlayingForArtistRow
+	for rows.Next() {
+		var i ListNowPlayingForArtistRow
+		if err := rows.Scan(
+			&i.SongID,
+			&i.StartedAt,
+			&i.DurationMs,
+			&i.UserID,
+			&i.Username,
+			&i.DisplayName,
+			&i.UserImageID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listNowPlayingForSong = `-- name: ListNowPlayingForSong :many
+SELECT np.song_id, np.started_at, np.duration_ms, u.id AS user_id, u.username, u.display_name, u.image_id AS user_image_id
+FROM now_playing np JOIN users u ON u.id = np.user_id
+WHERE np.song_id = $1::bigint AND u.public
+  AND np.started_at + (COALESCE(np.duration_ms, 0) || ' milliseconds')::interval >= now()
+`
+
+type ListNowPlayingForSongRow struct {
+	SongID      int64              `json:"song_id"`
+	StartedAt   pgtype.Timestamptz `json:"started_at"`
+	DurationMs  *int32             `json:"duration_ms"`
+	UserID      int64              `json:"user_id"`
+	Username    string             `json:"username"`
+	DisplayName *string            `json:"display_name"`
+	UserImageID pgtype.UUID        `json:"user_image_id"`
+}
+
+func (q *Queries) ListNowPlayingForSong(ctx context.Context, songID int64) ([]ListNowPlayingForSongRow, error) {
+	rows, err := q.db.Query(ctx, listNowPlayingForSong, songID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListNowPlayingForSongRow
+	for rows.Next() {
+		var i ListNowPlayingForSongRow
+		if err := rows.Scan(
+			&i.SongID,
+			&i.StartedAt,
+			&i.DurationMs,
+			&i.UserID,
+			&i.Username,
+			&i.DisplayName,
+			&i.UserImageID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const upsertNowPlaying = `-- name: UpsertNowPlaying :exec

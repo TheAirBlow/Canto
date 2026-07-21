@@ -145,8 +145,8 @@ WHERE src.source_type = $1 AND src.extracted_id = $2
 `
 
 type FindSongBySourceParams struct {
-	SourceType  SourceType `json:"source_type"`
-	ExtractedID *string    `json:"extracted_id"`
+	SourceType  string  `json:"source_type"`
+	ExtractedID *string `json:"extracted_id"`
 }
 
 func (q *Queries) FindSongBySource(ctx context.Context, arg FindSongBySourceParams) (Song, error) {

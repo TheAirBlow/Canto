@@ -10,8 +10,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"Canto/internal/db"
 )
 
 // deezerIDPattern matches a Deezer numeric entity id.
@@ -246,7 +244,7 @@ func (p *deezerProcessor) State(context.Context) State {
 }
 
 // Type identifies this processor's source_type.
-func (p *deezerProcessor) Type() db.SourceType { return db.SourceTypeDeezer }
+func (p *deezerProcessor) Type() SourceType { return SourceTypeDeezer }
 
 // get performs a GET request against reqURL and decodes the JSON response into out.
 func (p *deezerProcessor) get(ctx context.Context, reqURL string, out any) error {

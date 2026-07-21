@@ -7,10 +7,11 @@ import (
 
 	"Canto/internal/db"
 	"Canto/internal/search"
+	"Canto/internal/source"
 )
 
 // ResolveArtist finds or creates the artist matching extractedID/name, in that priority order, returning its id and whether this call created it.
-func (e *Engine) ResolveArtist(ctx context.Context, name string, sourceType db.SourceType, extractedID, rawURL string, matchers []FuzzyMatcher, normalize bool) (int64, bool, error) {
+func (e *Engine) ResolveArtist(ctx context.Context, name string, sourceType source.SourceType, extractedID, rawURL string, matchers []FuzzyMatcher, normalize bool) (int64, bool, error) {
 	nameNorm := NormalizeName(name)
 	matchName := name
 	if normalize {
@@ -18,7 +19,7 @@ func (e *Engine) ResolveArtist(ctx context.Context, name string, sourceType db.S
 	}
 
 	if extractedID != "" {
-		id, err := e.queries.GetSourceEntityID(ctx, db.GetSourceEntityIDParams{SourceType: sourceType, ExtractedID: &extractedID})
+		id, err := e.queries.GetSourceEntityID(ctx, db.GetSourceEntityIDParams{SourceType: string(sourceType), ExtractedID: &extractedID})
 		switch {
 		case err == nil:
 			slog.Debug("correlate: artist resolved via source id", "id", id, "source", sourceType)
@@ -42,7 +43,7 @@ func (e *Engine) ResolveArtist(ctx context.Context, name string, sourceType db.S
 }
 
 // createArtistLocked serializes creation of a new artist under an advisory lock keyed by name.
-func (e *Engine) createArtistLocked(ctx context.Context, name, nameNorm, matchName string, sourceType db.SourceType, rawURL, extractedID string, matchers []FuzzyMatcher) (int64, bool, error) {
+func (e *Engine) createArtistLocked(ctx context.Context, name, nameNorm, matchName string, sourceType source.SourceType, rawURL, extractedID string, matchers []FuzzyMatcher) (int64, bool, error) {
 	tx, err := e.pool.Begin(ctx)
 	if err != nil {
 		return 0, false, fmt.Errorf("correlate: begin artist create tx: %w", err)

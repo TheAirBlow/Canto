@@ -1,11 +1,11 @@
 package importer
 
 import (
+	"context"
 	"io"
 	"strings"
 	"time"
 
-	"Canto/internal/db"
 	"Canto/internal/ingest"
 )
 
@@ -16,7 +16,7 @@ type spotifyFormat struct{}
 func newSpotifyFormat() Format { return spotifyFormat{} }
 
 // ID identifies this format's import_service discriminator.
-func (spotifyFormat) ID() db.ImportService { return db.ImportServiceSpotify }
+func (spotifyFormat) ID() ImportService { return ImportServiceSpotify }
 
 // spotifyEntry is one entry in a Spotify extended-streaming-history export.
 type spotifyEntry struct {
@@ -28,14 +28,9 @@ type spotifyEntry struct {
 	SpotifyTrack string `json:"spotify_track_uri"`
 }
 
-// CountEntries does a cheap structural scan of r for the raw top-level entry count.
-func (spotifyFormat) CountEntries(r io.Reader) (int, error) {
-	return countJSONArray(r)
-}
-
-// Parse streams r, calling emit once per raw top-level entry.
-func (spotifyFormat) Parse(r io.Reader, emit func(ingest.ListenInput)) error {
-	return decodeJSONArray(r, func(e spotifyEntry) {
+// Parse returns r's total entry count immediately, then streams entries from startIdx onward to out in the background.
+func (spotifyFormat) Parse(ctx context.Context, r io.Reader, out chan<- ingest.ListenInput, startIdx int) (int, error) {
+	return parseJSONArray(ctx, r, out, startIdx, func(e spotifyEntry) ingest.ListenInput {
 		listenedAt, _ := time.Parse(time.RFC3339, e.Timestamp)
 
 		var artists []string
@@ -47,7 +42,7 @@ func (spotifyFormat) Parse(r io.Reader, emit func(ingest.ListenInput)) error {
 			originURL = "https://open.spotify.com/track/" + id
 		}
 
-		emit(ingest.ListenInput{
+		return ingest.ListenInput{
 			OriginalSubmissionClient: "spotify_export",
 			OriginURL:                originURL,
 			ArtistNames:              artists,
@@ -55,6 +50,6 @@ func (spotifyFormat) Parse(r io.Reader, emit func(ingest.ListenInput)) error {
 			AlbumName:                e.AlbumName,
 			ListenedAt:               listenedAt,
 			DurationPlayedMs:         e.MsPlayed,
-		})
+		}
 	})
 }

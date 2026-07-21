@@ -79,7 +79,7 @@ func (l *Lookup) sources(ctx context.Context, entityType db.EntityType, entityID
 			if row.ExtractedID == nil {
 				continue
 			}
-			processor, ok := l.registry.ByType(row.SourceType)
+			processor, ok := l.registry.ByType(source.SourceType(row.SourceType))
 			if !ok {
 				continue
 			}

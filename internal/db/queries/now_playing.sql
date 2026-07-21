@@ -18,3 +18,25 @@ WHERE user_id = $1
 
 -- name: DeleteAllNowPlaying :exec
 DELETE FROM now_playing;
+
+-- name: ListNowPlayingForSong :many
+SELECT np.song_id, np.started_at, np.duration_ms, u.id AS user_id, u.username, u.display_name, u.image_id AS user_image_id
+FROM now_playing np JOIN users u ON u.id = np.user_id
+WHERE np.song_id = sqlc.arg(song_id)::bigint AND u.public
+  AND np.started_at + (COALESCE(np.duration_ms, 0) || ' milliseconds')::interval >= now();
+
+-- name: ListNowPlayingForAlbum :many
+SELECT np.song_id, np.started_at, np.duration_ms, u.id AS user_id, u.username, u.display_name, u.image_id AS user_image_id
+FROM now_playing np
+JOIN song_albums sa ON sa.song_id = np.song_id
+JOIN users u ON u.id = np.user_id
+WHERE sa.album_id = sqlc.arg(album_id)::bigint AND u.public
+  AND np.started_at + (COALESCE(np.duration_ms, 0) || ' milliseconds')::interval >= now();
+
+-- name: ListNowPlayingForArtist :many
+SELECT np.song_id, np.started_at, np.duration_ms, u.id AS user_id, u.username, u.display_name, u.image_id AS user_image_id
+FROM now_playing np
+JOIN song_artists sar ON sar.song_id = np.song_id
+JOIN users u ON u.id = np.user_id
+WHERE sar.artist_id = sqlc.arg(artist_id)::bigint AND u.public
+  AND np.started_at + (COALESCE(np.duration_ms, 0) || ' milliseconds')::interval >= now();

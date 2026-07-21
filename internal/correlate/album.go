@@ -7,10 +7,11 @@ import (
 
 	"Canto/internal/db"
 	"Canto/internal/search"
+	"Canto/internal/source"
 )
 
 // ResolveAlbum finds or creates the album matching extractedID/name, links it to every id in artistIDs, and returns its id and whether this call created it.
-func (e *Engine) ResolveAlbum(ctx context.Context, name string, sourceType db.SourceType, extractedID, rawURL string, artistIDs []int64, matchers []FuzzyMatcher, normalize bool) (int64, bool, error) {
+func (e *Engine) ResolveAlbum(ctx context.Context, name string, sourceType source.SourceType, extractedID, rawURL string, artistIDs []int64, matchers []FuzzyMatcher, normalize bool) (int64, bool, error) {
 	albumID, created, err := e.resolveAlbum(ctx, name, sourceType, extractedID, rawURL, artistIDs, matchers, normalize)
 	if err != nil {
 		return 0, false, err
@@ -26,7 +27,7 @@ func (e *Engine) ResolveAlbum(ctx context.Context, name string, sourceType db.So
 }
 
 // resolveAlbum finds or creates the album, without linking it to any artist.
-func (e *Engine) resolveAlbum(ctx context.Context, name string, sourceType db.SourceType, extractedID, rawURL string, artistIDs []int64, matchers []FuzzyMatcher, normalize bool) (int64, bool, error) {
+func (e *Engine) resolveAlbum(ctx context.Context, name string, sourceType source.SourceType, extractedID, rawURL string, artistIDs []int64, matchers []FuzzyMatcher, normalize bool) (int64, bool, error) {
 	nameNorm := NormalizeName(name)
 	matchName := name
 	if normalize {
@@ -34,7 +35,7 @@ func (e *Engine) resolveAlbum(ctx context.Context, name string, sourceType db.So
 	}
 
 	if extractedID != "" {
-		id, err := e.queries.GetSourceEntityID(ctx, db.GetSourceEntityIDParams{SourceType: sourceType, ExtractedID: &extractedID})
+		id, err := e.queries.GetSourceEntityID(ctx, db.GetSourceEntityIDParams{SourceType: string(sourceType), ExtractedID: &extractedID})
 		switch {
 		case err == nil:
 			slog.Debug("correlate: album resolved via source id", "id", id, "source", sourceType)
@@ -58,7 +59,7 @@ func (e *Engine) resolveAlbum(ctx context.Context, name string, sourceType db.So
 }
 
 // createAlbumLocked serializes creation of a new album under an advisory lock keyed by name.
-func (e *Engine) createAlbumLocked(ctx context.Context, name, nameNorm, matchName string, sourceType db.SourceType, rawURL, extractedID string, artistIDs []int64, matchers []FuzzyMatcher) (int64, bool, error) {
+func (e *Engine) createAlbumLocked(ctx context.Context, name, nameNorm, matchName string, sourceType source.SourceType, rawURL, extractedID string, artistIDs []int64, matchers []FuzzyMatcher) (int64, bool, error) {
 	tx, err := e.pool.Begin(ctx)
 	if err != nil {
 		return 0, false, fmt.Errorf("correlate: begin album create tx: %w", err)

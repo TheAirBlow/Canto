@@ -11,6 +11,7 @@ import (
 
 	"Canto/internal/db"
 	"Canto/internal/search"
+	"Canto/internal/source"
 )
 
 // Engine runs the correlation algorithm against a Postgres pool.
@@ -29,7 +30,7 @@ func NewEngine(pool *pgxpool.Pool, searchClient *search.Client) *Engine {
 var advisoryLockSeed = map[string]int64{"artist": 1, "album": 2, "song": 3}
 
 // attachSource inserts a sources row for entityID, tolerating a concurrent duplicate insert for the same source_type and extracted_id pair.
-func (e *Engine) attachSource(ctx context.Context, q *db.Queries, entityType db.EntityType, entityID int64, sourceType db.SourceType, rawURL, extractedID string, method db.CorrelationMethod, confidence *float32) error {
+func (e *Engine) attachSource(ctx context.Context, q *db.Queries, entityType db.EntityType, entityID int64, sourceType source.SourceType, rawURL, extractedID string, method db.CorrelationMethod, confidence *float32) error {
 	if rawURL == "" && extractedID == "" {
 		return nil // nothing worth recording
 	}
@@ -43,7 +44,7 @@ func (e *Engine) attachSource(ctx context.Context, q *db.Queries, entityType db.
 	_, err := q.InsertSourceIfAbsent(ctx, db.InsertSourceIfAbsentParams{
 		EntityType:        entityType,
 		EntityID:          entityID,
-		SourceType:        sourceType,
+		SourceType:        string(sourceType),
 		RawUrl:            rawURLPtr,
 		ExtractedID:       extractedIDPtr,
 		CorrelationMethod: method,

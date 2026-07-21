@@ -11,8 +11,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"Canto/internal/db"
 )
 
 // spotifyIDPattern matches a Spotify base62 entity id.
@@ -486,7 +484,7 @@ func (p *spotifyProcessor) State(context.Context) State {
 }
 
 // Type identifies this processor's source_type.
-func (p *spotifyProcessor) Type() db.SourceType { return db.SourceTypeSpotify }
+func (p *spotifyProcessor) Type() SourceType { return SourceTypeSpotify }
 
 // spotifyBestSourceThumbnail picks the widest thumbnail URL from a pathfinder image "sources" array.
 func spotifyBestSourceThumbnail(sources []any) string {

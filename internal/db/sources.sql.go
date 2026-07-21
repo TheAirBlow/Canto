@@ -14,8 +14,8 @@ SELECT entity_id FROM sources WHERE source_type = $1 AND extracted_id = $2
 `
 
 type GetSourceEntityIDParams struct {
-	SourceType  SourceType `json:"source_type"`
-	ExtractedID *string    `json:"extracted_id"`
+	SourceType  string  `json:"source_type"`
+	ExtractedID *string `json:"extracted_id"`
 }
 
 func (q *Queries) GetSourceEntityID(ctx context.Context, arg GetSourceEntityIDParams) (int64, error) {
@@ -35,7 +35,7 @@ RETURNING id, entity_type, entity_id, source_type, raw_url, extracted_id, correl
 type InsertSourceIfAbsentParams struct {
 	EntityType        EntityType        `json:"entity_type"`
 	EntityID          int64             `json:"entity_id"`
-	SourceType        SourceType        `json:"source_type"`
+	SourceType        string            `json:"source_type"`
 	RawUrl            *string           `json:"raw_url"`
 	ExtractedID       *string           `json:"extracted_id"`
 	CorrelationMethod CorrelationMethod `json:"correlation_method"`

@@ -2,16 +2,21 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"net/http"
+	"slices"
 	"strconv"
+	"strings"
 	"time"
 
-	"Canto/internal/db"
 	"Canto/internal/search"
 )
 
-// searchLimit bounds how many hits a single search request returns.
+// searchLimit bounds how many hits a single search request returns, per type.
 const searchLimit = 25
+
+// validSearchTypes lists every value the "type" query param accepts.
+var validSearchTypes = []string{"artist", "album", "song", "user", "own_listens"}
 
 // registerSearch registers the search endpoint.
 func (s *Server) registerSearch(mux authMux) {
@@ -24,6 +29,7 @@ type searchResultResponse struct {
 	Artist    *artistResponse    `json:"artist,omitempty"`
 	Album     *albumResponse     `json:"album,omitempty"`
 	Song      *songResponse      `json:"song,omitempty"`
+	User      *userResponse      `json:"user,omitempty"`
 	OwnListen *ownListenResponse `json:"own_listen,omitempty"`
 }
 
@@ -34,37 +40,29 @@ type ownListenResponse struct {
 	Song       songResponse `json:"song"`
 }
 
-// searchQuery queries the catalog or the caller's own listen history.
+// searchQuery queries any combination of the catalog, user profiles, and the caller's own listen history.
 func (s *Server) searchQuery(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query().Get("q")
 	if q == "" {
 		badRequest(w, "q is required")
 		return
 	}
-	entityType := r.URL.Query().Get("type")
-	if entityType == "" {
-		entityType = "all"
-	}
-
-	if entityType == "own_listens" {
-		s.searchOwnListens(w, r, q)
+	types, err := parseSearchTypes(r.URL.Query().Get("type"))
+	if err != nil {
+		badRequest(w, err.Error())
 		return
 	}
 
-	var types []string
-	switch entityType {
-	case "artist", "album", "song":
-		types = []string{entityType}
-	case "all":
-		types = []string{"artist", "album", "song"}
-	default:
-		badRequest(w, "type must be artist, album, song, all, or own_listens")
-		return
+	limit := searchLimit
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			limit = n
+		}
 	}
 
 	var results []searchResultResponse
 	for _, t := range types {
-		hits, err := s.search.Search(r.Context(), t+"s", q, "", searchLimit)
+		hits, err := s.search.Search(r.Context(), t+"s", q, "", limit)
 		if err != nil {
 			internalError(w, err.Error())
 			return
@@ -77,6 +75,30 @@ func (s *Server) searchQuery(w http.ResponseWriter, r *http.Request) {
 		results = append(results, rows...)
 	}
 	ok(w, results)
+}
+
+// parseSearchTypes splits raw on commas into a deduplicated, validated type list, defaulting to artist/album/song when empty.
+func parseSearchTypes(raw string) ([]string, error) {
+	if raw == "" {
+		return []string{"artist", "album", "song"}, nil
+	}
+	seen := make(map[string]bool)
+	var types []string
+	for _, t := range strings.Split(raw, ",") {
+		t = strings.TrimSpace(t)
+		if t == "" || seen[t] {
+			continue
+		}
+		if !slices.Contains(validSearchTypes, t) {
+			return nil, fmt.Errorf("type must be a comma-separated list of: %s", strings.Join(validSearchTypes, ", "))
+		}
+		seen[t] = true
+		types = append(types, t)
+	}
+	if len(types) == 0 {
+		return nil, fmt.Errorf("type must be a comma-separated list of: %s", strings.Join(validSearchTypes, ", "))
+	}
+	return types, nil
 }
 
 // searchResults batch-fetches full entity rows for hits of entityType.
@@ -112,6 +134,17 @@ func (s *Server) searchResults(ctx context.Context, entityType string, hits []se
 			out[i] = searchResultResponse{Type: "album", Album: &resp}
 		}
 		return out, nil
+	case "user":
+		rows, err := s.queries.GetUsersByIDs(ctx, ids)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]searchResultResponse, len(rows))
+		for i, row := range rows {
+			resp := newUserResponse(row)
+			out[i] = searchResultResponse{Type: "user", User: &resp}
+		}
+		return out, nil
 	default:
 		rows, err := s.queries.GetSongsByIDs(ctx, ids)
 		if err != nil {
@@ -124,61 +157,4 @@ func (s *Server) searchResults(ctx context.Context, entityType string, hits []se
 		}
 		return out, nil
 	}
-}
-
-// searchOwnListens searches the caller's own listen history by song/artist name.
-func (s *Server) searchOwnListens(w http.ResponseWriter, r *http.Request, q string) {
-	user, err := s.authenticateCookie(r)
-	if err != nil {
-		if isAuthError(err) {
-			unauthorized(w, err.Error())
-		} else {
-			internalError(w, err.Error())
-		}
-		return
-	}
-
-	limit := searchLimit
-	if raw := r.URL.Query().Get("limit"); raw != "" {
-		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
-			limit = n
-		}
-	}
-
-	rows, err := s.queries.SearchListensForUser(r.Context(), db.SearchListensForUserParams{
-		UserID: user.ID, Query: q, MaxRows: int32(limit),
-	})
-	if err != nil {
-		internalError(w, err.Error())
-		return
-	}
-	if len(rows) == 0 {
-		ok(w, []searchResultResponse{})
-		return
-	}
-
-	songIDs := make([]int64, len(rows))
-	for i, row := range rows {
-		songIDs[i] = row.SongID
-	}
-	songs, err := s.queries.GetSongsByIDs(r.Context(), songIDs)
-	if err != nil {
-		internalError(w, err.Error())
-		return
-	}
-	songByID := make(map[int64]db.Song, len(songs))
-	for _, song := range songs {
-		songByID[song.ID] = song
-	}
-
-	results := make([]searchResultResponse, 0, len(rows))
-	for _, row := range rows {
-		song, ok := songByID[row.SongID]
-		if !ok {
-			continue
-		}
-		listen := ownListenResponse{ListenID: row.ID, ListenedAt: row.ListenedAt.Time, Song: newSongResponse(song)}
-		results = append(results, searchResultResponse{Type: "own_listen", OwnListen: &listen})
-	}
-	ok(w, results)
 }

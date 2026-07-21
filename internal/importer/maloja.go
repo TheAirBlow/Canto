@@ -1,11 +1,11 @@
 package importer
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"time"
 
-	"Canto/internal/db"
 	"Canto/internal/ingest"
 )
 
@@ -16,7 +16,7 @@ type malojaFormat struct{}
 func newMalojaFormat() Format { return malojaFormat{} }
 
 // ID identifies this format's import_service discriminator.
-func (malojaFormat) ID() db.ImportService { return db.ImportServiceMaloja }
+func (malojaFormat) ID() ImportService { return ImportServiceMaloja }
 
 // malojaExport is a Maloja scrobble export document.
 type malojaExport struct {
@@ -31,32 +31,33 @@ type malojaExport struct {
 	} `json:"scrobbles"`
 }
 
-// CountEntries does a cheap structural scan of r for the raw top-level entry count.
-func (f malojaFormat) CountEntries(r io.Reader) (int, error) {
+// Parse returns doc's total entry count immediately, then streams entries from startIdx onward to out in the background.
+func (f malojaFormat) Parse(ctx context.Context, r io.Reader, out chan<- ingest.ListenInput, startIdx int) (int, error) {
 	doc, err := f.decode(r)
 	if err != nil {
 		return 0, err
 	}
-	return len(doc.Scrobbles), nil
-}
 
-// Parse streams r, calling emit once per raw top-level entry.
-func (f malojaFormat) Parse(r io.Reader, emit func(ingest.ListenInput)) error {
-	doc, err := f.decode(r)
-	if err != nil {
-		return err
-	}
-	for _, s := range doc.Scrobbles {
-		emit(ingest.ListenInput{
-			OriginalSubmissionClient: "maloja_export",
-			ArtistNames:              s.Track.Artists,
-			SongName:                 s.Track.Title,
-			AlbumName:                s.Track.Album,
-			ListenedAt:               time.Unix(s.Time, 0).UTC(),
-			DurationMs:               s.Track.Length * 1000,
-		})
-	}
-	return nil
+	go func() {
+		defer close(out)
+		for i := startIdx; i < len(doc.Scrobbles); i++ {
+			s := doc.Scrobbles[i]
+			entry := ingest.ListenInput{
+				OriginalSubmissionClient: "maloja_export",
+				ArtistNames:              s.Track.Artists,
+				SongName:                 s.Track.Title,
+				AlbumName:                s.Track.Album,
+				ListenedAt:               time.Unix(s.Time, 0).UTC(),
+				DurationMs:               s.Track.Length * 1000,
+			}
+			select {
+			case out <- entry:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return len(doc.Scrobbles), nil
 }
 
 // decode fully decodes r as a malojaExport document.

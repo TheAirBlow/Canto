@@ -7,10 +7,11 @@ import (
 
 	"Canto/internal/db"
 	"Canto/internal/search"
+	"Canto/internal/source"
 )
 
 // ResolveSong finds or creates the song matching extractedID/name, links it to artistIDs and to albumID, and returns its id and whether this call created it.
-func (e *Engine) ResolveSong(ctx context.Context, name string, sourceType db.SourceType, extractedID, rawURL string, durationMs *int32, artistIDs []int64, albumID *int64, trackNumber *int32, matchers []FuzzyMatcher, normalize bool) (int64, bool, error) {
+func (e *Engine) ResolveSong(ctx context.Context, name string, sourceType source.SourceType, extractedID, rawURL string, durationMs *int32, artistIDs []int64, albumID *int64, trackNumber *int32, matchers []FuzzyMatcher, normalize bool) (int64, bool, error) {
 	songID, created, err := e.resolveSong(ctx, name, sourceType, extractedID, rawURL, durationMs, artistIDs, albumID, matchers, normalize)
 	if err != nil {
 		return 0, false, err
@@ -29,7 +30,7 @@ func (e *Engine) ResolveSong(ctx context.Context, name string, sourceType db.Sou
 }
 
 // resolveSong finds or creates the song, without linking it to any artist or album.
-func (e *Engine) resolveSong(ctx context.Context, name string, sourceType db.SourceType, extractedID, rawURL string, durationMs *int32, artistIDs []int64, albumID *int64, matchers []FuzzyMatcher, normalize bool) (int64, bool, error) {
+func (e *Engine) resolveSong(ctx context.Context, name string, sourceType source.SourceType, extractedID, rawURL string, durationMs *int32, artistIDs []int64, albumID *int64, matchers []FuzzyMatcher, normalize bool) (int64, bool, error) {
 	nameNorm := NormalizeName(name)
 	matchName := name
 	if normalize {
@@ -37,7 +38,7 @@ func (e *Engine) resolveSong(ctx context.Context, name string, sourceType db.Sou
 	}
 
 	if extractedID != "" {
-		id, err := e.queries.GetSourceEntityID(ctx, db.GetSourceEntityIDParams{SourceType: sourceType, ExtractedID: &extractedID})
+		id, err := e.queries.GetSourceEntityID(ctx, db.GetSourceEntityIDParams{SourceType: string(sourceType), ExtractedID: &extractedID})
 		switch {
 		case err == nil:
 			slog.Debug("correlate: song resolved via source id", "id", id, "source", sourceType)
@@ -61,7 +62,7 @@ func (e *Engine) resolveSong(ctx context.Context, name string, sourceType db.Sou
 }
 
 // createSongLocked serializes creation of a new song under an advisory lock keyed by name.
-func (e *Engine) createSongLocked(ctx context.Context, name, nameNorm, matchName string, sourceType db.SourceType, rawURL, extractedID string, durationMs *int32, artistIDs []int64, albumID *int64, matchers []FuzzyMatcher) (int64, bool, error) {
+func (e *Engine) createSongLocked(ctx context.Context, name, nameNorm, matchName string, sourceType source.SourceType, rawURL, extractedID string, durationMs *int32, artistIDs []int64, albumID *int64, matchers []FuzzyMatcher) (int64, bool, error) {
 	tx, err := e.pool.Begin(ctx)
 	if err != nil {
 		return 0, false, fmt.Errorf("correlate: begin song create tx: %w", err)

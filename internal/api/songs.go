@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -25,6 +26,8 @@ func (s *Server) registerSongs(mux authMux) {
 	mux.HandleFunc("GET /songs/{id}/aliases", s.listSongAliases)
 	mux.AdminAuthHandleFunc("POST /songs/{id}/aliases", s.createSongAlias)
 	mux.AdminAuthHandleFunc("DELETE /songs/{id}/aliases/{alias_id}", s.deleteSongAlias)
+	mux.HandleFunc("GET /songs/{id}/listens", s.listSongListens)
+	mux.HandleFunc("GET /songs/{id}/now-playing", s.listSongNowPlaying)
 }
 
 // songResponse is the public-facing song shape.
@@ -47,9 +50,10 @@ type songDetailResponse struct {
 	Artists     []artistResponse `json:"artists"`
 	Album       *albumResponse   `json:"album,omitempty"`
 	TrackNumber *int32           `json:"track_number,omitempty"`
+	Stats       json.RawMessage  `json:"stats,omitempty"`
 }
 
-// getSong returns a single song by id, with its artists and album.
+// getSong returns a single song by id, with its artists, album, and global listening stats.
 func (s *Server) getSong(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r)
 	if err != nil {
@@ -67,8 +71,12 @@ func (s *Server) getSong(w http.ResponseWriter, r *http.Request) {
 		internalError(w, err.Error())
 		return
 	}
+	stats, err := s.stats.EntitySummary(r.Context(), "song", id)
+	if err != nil {
+		slog.Warn("song stats fetch failed", "id", id, "err", err)
+	}
 
-	resp := songDetailResponse{songResponse: newSongResponse(song), Artists: make([]artistResponse, len(artists))}
+	resp := songDetailResponse{songResponse: newSongResponse(song), Artists: make([]artistResponse, len(artists)), Stats: stats}
 	for i, a := range artists {
 		resp.Artists[i] = newArtistResponse(a)
 	}
@@ -83,6 +91,59 @@ func (s *Server) getSong(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ok(w, resp)
+}
+
+// listSongListens returns every listen of this song by any user, newest first, anonymizing private users.
+func (s *Server) listSongListens(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r)
+	if err != nil {
+		badRequest(w, err.Error())
+		return
+	}
+	page, perPage := parsePagination(r)
+	offset := int32((page - 1) * perPage)
+
+	rows, err := s.queries.ListListensForSong(r.Context(), db.ListListensForSongParams{SongID: id, MaxRows: int32(perPage), RowOffset: offset})
+	if err != nil {
+		internalError(w, err.Error())
+		return
+	}
+	total, err := s.queries.CountListensForSong(r.Context(), id)
+	if err != nil {
+		internalError(w, err.Error())
+		return
+	}
+
+	listens := make([]listenResponse, len(rows))
+	for i, row := range rows {
+		listens[i] = listenResponse{ListenedAt: row.ListenedAt.Time}
+		if row.Public {
+			listens[i].User = &listenerResponse{ID: &row.UserID, Username: &row.Username, DisplayName: row.DisplayName, ImageURL: imageURL(row.UserImageID)}
+		}
+	}
+	ok(w, listensPage{Listens: listens, Total: total, Page: page, PerPage: perPage})
+}
+
+// listSongNowPlaying returns every public user currently listening to this song.
+func (s *Server) listSongNowPlaying(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r)
+	if err != nil {
+		badRequest(w, err.Error())
+		return
+	}
+	rows, err := s.queries.ListNowPlayingForSong(r.Context(), id)
+	if err != nil {
+		internalError(w, err.Error())
+		return
+	}
+	out := make([]listeningNowResponse, len(rows))
+	for i, row := range rows {
+		out[i] = listeningNowResponse{
+			User:      listenerResponse{ID: &row.UserID, Username: &row.Username, DisplayName: row.DisplayName, ImageURL: imageURL(row.UserImageID)},
+			StartedAt: row.StartedAt.Time,
+		}
+	}
+	ok(w, out)
 }
 
 // updateSong edits an existing song's name.

@@ -3,8 +3,6 @@ package source
 import (
 	"context"
 	"log/slog"
-
-	"Canto/internal/db"
 )
 
 // Registry holds every known Processor, keyed by ID.
@@ -32,7 +30,7 @@ func (r *Registry) OrderedFallback(ctx context.Context, ids []string) []Processo
 }
 
 // ByType looks up the registered processor for sourceType, regardless of configured ordering.
-func (r *Registry) ByType(sourceType db.SourceType) (Processor, bool) {
+func (r *Registry) ByType(sourceType SourceType) (Processor, bool) {
 	for _, p := range r.processors {
 		if p.Type() == sourceType {
 			return p, true

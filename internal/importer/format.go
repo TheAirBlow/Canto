@@ -1,28 +1,36 @@
 package importer
 
 import (
+	"context"
 	"io"
 
-	"Canto/internal/db"
 	"Canto/internal/ingest"
 )
 
+// ImportService discriminates which bulk-import file format a job was submitted under.
+type ImportService string
+
+const (
+	ImportServiceSpotify      ImportService = "spotify"
+	ImportServiceYtmusic      ImportService = "ytmusic"
+	ImportServiceLastfm       ImportService = "lastfm"
+	ImportServiceListenbrainz ImportService = "listenbrainz"
+	ImportServiceMaloja       ImportService = "maloja"
+	ImportServiceCantoExport  ImportService = "canto_export"
+	ImportServiceKoito        ImportService = "koito"
+)
+
 // Format translates one bulk-import file format into ListenInput entries.
-//
-// Parse calls emit once per raw top-level entry it finds, even ones it can't fully parse -- an entry
-// emitted with both SongName and OriginURL empty signals a parse failure for that entry (counted as
-// skipped, never submitted), so every raw entry is accounted for in the job's progress counters.
 type Format interface {
 	// ID is this format's import_service discriminator.
-	ID() db.ImportService
-	// CountEntries does a cheap structural scan of r for the raw top-level entry count.
-	CountEntries(r io.Reader) (int, error)
-	// Parse streams r, calling emit once per raw top-level entry.
-	Parse(r io.Reader, emit func(ingest.ListenInput)) error
+	ID() ImportService
+
+	// Parse returns r's total entry count immediately, then streams entries from startIdx onward to out in the background, closing out when done.
+	Parse(ctx context.Context, r io.Reader, out chan<- ingest.ListenInput, startIdx int) (int, error)
 }
 
 // defaultFormats returns every built-in Format, keyed by its import_service.
-func defaultFormats() map[db.ImportService]Format {
+func defaultFormats() map[ImportService]Format {
 	formats := []Format{
 		newCantoExportFormat(),
 		newListenBrainzFormat(),
@@ -30,8 +38,9 @@ func defaultFormats() map[db.ImportService]Format {
 		newLastFMFormat(),
 		newMalojaFormat(),
 		newYTMusicFormat(),
+		newKoitoFormat(),
 	}
-	out := make(map[db.ImportService]Format, len(formats))
+	out := make(map[ImportService]Format, len(formats))
 	for _, f := range formats {
 		out[f.ID()] = f
 	}
