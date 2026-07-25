@@ -11,6 +11,67 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const deleteStatsCache = `-- name: DeleteStatsCache :exec
+TRUNCATE stats_cache
+`
+
+func (q *Queries) DeleteStatsCache(ctx context.Context) error {
+	_, err := q.db.Exec(ctx, deleteStatsCache)
+	return err
+}
+
+const deleteStatsCacheForUser = `-- name: DeleteStatsCacheForUser :exec
+DELETE FROM stats_cache WHERE user_id = $1::bigint OR user_id IS NULL
+`
+
+func (q *Queries) DeleteStatsCacheForUser(ctx context.Context, userID int64) error {
+	_, err := q.db.Exec(ctx, deleteStatsCacheForUser, userID)
+	return err
+}
+
+const entityUserSummary = `-- name: EntityUserSummary :one
+SELECT count(*)::bigint AS plays,
+       (coalesce(sum(coalesce(l.duration_played_ms, s.duration_ms, 0)), 0)::float8 / 60000.0)::float8 AS minutes_listened,
+       min(l.listened_at)::timestamptz AS first_listened_at
+FROM listens l
+JOIN songs s ON s.id = l.song_id
+WHERE l.user_id = $1::bigint
+  AND (s.duration_ms IS NULL OR s.duration_ms <= 0
+       OR coalesce(l.duration_played_ms, s.duration_ms, 0) * 2 >= s.duration_ms
+       OR coalesce(l.duration_played_ms, s.duration_ms, 0) >= 240000)
+  AND ($2::bigint IS NULL OR EXISTS (
+        SELECT 1 FROM song_artists sar WHERE sar.song_id = l.song_id AND sar.artist_id = $2::bigint))
+  AND ($3::bigint IS NULL OR EXISTS (
+        SELECT 1 FROM song_albums sa2 WHERE sa2.song_id = l.song_id AND sa2.album_id = $3::bigint))
+  AND ($4::bigint IS NULL OR l.song_id = $4::bigint)
+`
+
+type EntityUserSummaryParams struct {
+	UserID   int64  `json:"user_id"`
+	ArtistID *int64 `json:"artist_id"`
+	AlbumID  *int64 `json:"album_id"`
+	SongID   *int64 `json:"song_id"`
+}
+
+type EntityUserSummaryRow struct {
+	Plays           int64              `json:"plays"`
+	MinutesListened float64            `json:"minutes_listened"`
+	FirstListenedAt pgtype.Timestamptz `json:"first_listened_at"`
+}
+
+// Stays a live query: one user's listens of one entity, small and bounded (see InterestHistory).
+func (q *Queries) EntityUserSummary(ctx context.Context, arg EntityUserSummaryParams) (EntityUserSummaryRow, error) {
+	row := q.db.QueryRow(ctx, entityUserSummary,
+		arg.UserID,
+		arg.ArtistID,
+		arg.AlbumID,
+		arg.SongID,
+	)
+	var i EntityUserSummaryRow
+	err := row.Scan(&i.Plays, &i.MinutesListened, &i.FirstListenedAt)
+	return i, err
+}
+
 const getStatsCache = `-- name: GetStatsCache :one
 SELECT id, user_id, artist_id, album_id, song_id, resource, params, data, computed_at FROM stats_cache
 WHERE user_id IS NOT DISTINCT FROM $1::bigint
@@ -62,10 +123,6 @@ WHERE ($1::bigint IS NULL OR l.user_id = $1::bigint)
   AND (s.duration_ms IS NULL OR s.duration_ms <= 0
        OR coalesce(l.duration_played_ms, s.duration_ms, 0) * 2 >= s.duration_ms
        OR coalesce(l.duration_played_ms, s.duration_ms, 0) >= 240000)
-  AND NOT EXISTS (
-    SELECT 1 FROM artist_blacklist bl JOIN song_artists sa ON sa.artist_id = bl.artist_id
-    WHERE bl.user_id = l.user_id AND sa.song_id = l.song_id
-  )
   AND ($2::bigint IS NULL OR EXISTS (
         SELECT 1 FROM song_artists sar WHERE sar.song_id = l.song_id AND sar.artist_id = $2::bigint))
   AND ($3::bigint IS NULL OR EXISTS (
@@ -141,6 +198,18 @@ func (q *Queries) ListStatsCache(ctx context.Context) ([]StatsCache, error) {
 	return items, nil
 }
 
+const pruneStaleStatsCache = `-- name: PruneStaleStatsCache :execrows
+DELETE FROM stats_cache WHERE computed_at < $1::timestamptz
+`
+
+func (q *Queries) PruneStaleStatsCache(ctx context.Context, before pgtype.Timestamptz) (int64, error) {
+	result, err := q.db.Exec(ctx, pruneStaleStatsCache, before)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const sourcesBreakdown = `-- name: SourcesBreakdown :many
 WITH user_listens AS (
     SELECT l.id, l.user_id, l.song_id, l.listened_at, l.client, l.duration_played_ms, l.extra, l.created_at FROM listens l
@@ -151,11 +220,6 @@ WITH user_listens AS (
       AND (s.duration_ms IS NULL OR s.duration_ms <= 0
            OR coalesce(l.duration_played_ms, s.duration_ms, 0) * 2 >= s.duration_ms
            OR coalesce(l.duration_played_ms, s.duration_ms, 0) >= 240000)
-      AND NOT EXISTS (
-        SELECT 1 FROM artist_blacklist bl
-        JOIN song_artists sa ON sa.artist_id = bl.artist_id
-        WHERE bl.user_id = l.user_id AND sa.song_id = l.song_id
-      )
 ),
 primary_source AS (
     SELECT song_id, source_type FROM (

@@ -14,7 +14,7 @@ type Registry struct {
 func NewRegistry(processors ...Processor) *Registry {
 	m := make(map[string]Processor, len(processors))
 	for _, p := range processors {
-		m[p.ID()] = p
+		m[p.ID()] = dedupe(p)
 	}
 	return &Registry{processors: m}
 }
@@ -27,6 +27,21 @@ func (r *Registry) OrderedLink(ctx context.Context, ids []string) []Processor {
 // OrderedFallback resolves ids to processors able to look up by text query right now in ids order.
 func (r *Registry) OrderedFallback(ctx context.Context, ids []string) []Processor {
 	return r.ordered(ctx, ids, func(s State) bool { return s.CanLookup })
+}
+
+// IDs returns every registered processor's id.
+func (r *Registry) IDs() []string {
+	ids := make([]string, 0, len(r.processors))
+	for id := range r.processors {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+// ByID looks up the registered processor for id.
+func (r *Registry) ByID(id string) (Processor, bool) {
+	p, ok := r.processors[id]
+	return p, ok
 }
 
 // ByType looks up the registered processor for sourceType, regardless of configured ordering.
@@ -49,6 +64,10 @@ func (r *Registry) ordered(ctx context.Context, ids []string, capable func(State
 			continue
 		}
 		if !capable(p.State(ctx)) {
+			slog.Warn("configured processor not currently available, skipping", "id", id)
+			continue
+		}
+		if a, ok := p.(Availabler); ok && !a.Available() {
 			slog.Warn("configured processor not currently available, skipping", "id", id)
 			continue
 		}

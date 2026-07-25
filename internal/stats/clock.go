@@ -23,13 +23,13 @@ func (e *Engine) Clock(ctx context.Context, userID *int64, tf Timeframe) (json.R
 	}
 	key := cacheKey{UserID: userID, Resource: db.StatsResourceClock, Params: tf}
 	return e.cached(ctx, key, func(ctx context.Context) (any, error) {
-		return e.computeClock(ctx, userID, from, to)
+		return e.computeClock(ctx, userID, from, to, tf.TZOrUTC())
 	})
 }
 
 // computeClock runs RollupClockGrid and zero-fills every one of the 168 cells.
-func (e *Engine) computeClock(ctx context.Context, userID *int64, from, to time.Time) ([]clockCell, error) {
-	rows, err := e.queries.RollupClockGrid(ctx, db.RollupClockGridParams{UserID: userID, FromDay: day(from), ToDay: day(to)})
+func (e *Engine) computeClock(ctx context.Context, userID *int64, from, to time.Time, tz string) ([]clockCell, error) {
+	rows, err := e.queries.RollupClockGrid(ctx, db.RollupClockGridParams{Tz: tz, UserID: userID, FromDay: day(from), ToDay: day(to)})
 	if err != nil {
 		return nil, err
 	}

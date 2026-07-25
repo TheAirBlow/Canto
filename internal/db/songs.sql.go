@@ -12,22 +12,29 @@ import (
 )
 
 const createSong = `-- name: CreateSong :one
-INSERT INTO songs (name, name_normalized, duration_ms) VALUES ($1, $2, $3) RETURNING id, name, name_normalized, duration_ms, image_id, pinned, created_at, updated_at
+INSERT INTO songs (name, name_normalized, name_romanized, duration_ms) VALUES ($1, $2, $3, $4) RETURNING id, name, name_normalized, name_romanized, duration_ms, image_id, pinned, created_at, updated_at
 `
 
 type CreateSongParams struct {
 	Name           string `json:"name"`
 	NameNormalized string `json:"name_normalized"`
+	NameRomanized  string `json:"name_romanized"`
 	DurationMs     *int32 `json:"duration_ms"`
 }
 
 func (q *Queries) CreateSong(ctx context.Context, arg CreateSongParams) (Song, error) {
-	row := q.db.QueryRow(ctx, createSong, arg.Name, arg.NameNormalized, arg.DurationMs)
+	row := q.db.QueryRow(ctx, createSong,
+		arg.Name,
+		arg.NameNormalized,
+		arg.NameRomanized,
+		arg.DurationMs,
+	)
 	var i Song
 	err := row.Scan(
 		&i.ID,
 		&i.Name,
 		&i.NameNormalized,
+		&i.NameRomanized,
 		&i.DurationMs,
 		&i.ImageID,
 		&i.Pinned,
@@ -59,7 +66,7 @@ func (q *Queries) DeleteSongArtists(ctx context.Context, songID int64) error {
 }
 
 const findSongByExactName = `-- name: FindSongByExactName :one
-SELECT id, name, name_normalized, duration_ms, image_id, pinned, created_at, updated_at FROM songs WHERE name = $1 OR name_normalized = $1 LIMIT 1
+SELECT id, name, name_normalized, name_romanized, duration_ms, image_id, pinned, created_at, updated_at FROM songs WHERE name = $1 LIMIT 1
 `
 
 func (q *Queries) FindSongByExactName(ctx context.Context, name string) (Song, error) {
@@ -69,6 +76,7 @@ func (q *Queries) FindSongByExactName(ctx context.Context, name string) (Song, e
 		&i.ID,
 		&i.Name,
 		&i.NameNormalized,
+		&i.NameRomanized,
 		&i.DurationMs,
 		&i.ImageID,
 		&i.Pinned,
@@ -79,9 +87,9 @@ func (q *Queries) FindSongByExactName(ctx context.Context, name string) (Song, e
 }
 
 const findSongByExactNameForArtists = `-- name: FindSongByExactNameForArtists :one
-SELECT s.id, s.name, s.name_normalized, s.duration_ms, s.image_id, s.pinned, s.created_at, s.updated_at FROM songs s
+SELECT s.id, s.name, s.name_normalized, s.name_romanized, s.duration_ms, s.image_id, s.pinned, s.created_at, s.updated_at FROM songs s
 JOIN song_artists sa ON sa.song_id = s.id
-WHERE (s.name = $1::text OR s.name_normalized = $1::text) AND sa.artist_id = ANY($2::bigint[])
+WHERE s.name = $1::text AND sa.artist_id = ANY($2::bigint[])
 LIMIT 1
 `
 
@@ -97,6 +105,7 @@ func (q *Queries) FindSongByExactNameForArtists(ctx context.Context, arg FindSon
 		&i.ID,
 		&i.Name,
 		&i.NameNormalized,
+		&i.NameRomanized,
 		&i.DurationMs,
 		&i.ImageID,
 		&i.Pinned,
@@ -107,10 +116,10 @@ func (q *Queries) FindSongByExactNameForArtists(ctx context.Context, arg FindSon
 }
 
 const findSongByExactNameForArtistsAndAlbum = `-- name: FindSongByExactNameForArtistsAndAlbum :one
-SELECT s.id, s.name, s.name_normalized, s.duration_ms, s.image_id, s.pinned, s.created_at, s.updated_at FROM songs s
+SELECT s.id, s.name, s.name_normalized, s.name_romanized, s.duration_ms, s.image_id, s.pinned, s.created_at, s.updated_at FROM songs s
 JOIN song_artists sa ON sa.song_id = s.id
 JOIN song_albums sal ON sal.song_id = s.id
-WHERE (s.name = $1::text OR s.name_normalized = $1::text)
+WHERE s.name = $1::text
   AND sa.artist_id = ANY($2::bigint[])
   AND sal.album_id = $3::bigint
 LIMIT 1
@@ -129,6 +138,7 @@ func (q *Queries) FindSongByExactNameForArtistsAndAlbum(ctx context.Context, arg
 		&i.ID,
 		&i.Name,
 		&i.NameNormalized,
+		&i.NameRomanized,
 		&i.DurationMs,
 		&i.ImageID,
 		&i.Pinned,
@@ -139,7 +149,7 @@ func (q *Queries) FindSongByExactNameForArtistsAndAlbum(ctx context.Context, arg
 }
 
 const findSongBySource = `-- name: FindSongBySource :one
-SELECT s.id, s.name, s.name_normalized, s.duration_ms, s.image_id, s.pinned, s.created_at, s.updated_at FROM songs s
+SELECT s.id, s.name, s.name_normalized, s.name_romanized, s.duration_ms, s.image_id, s.pinned, s.created_at, s.updated_at FROM songs s
 JOIN sources src ON src.entity_type = 'song' AND src.entity_id = s.id
 WHERE src.source_type = $1 AND src.extracted_id = $2
 `
@@ -156,6 +166,7 @@ func (q *Queries) FindSongBySource(ctx context.Context, arg FindSongBySourcePara
 		&i.ID,
 		&i.Name,
 		&i.NameNormalized,
+		&i.NameRomanized,
 		&i.DurationMs,
 		&i.ImageID,
 		&i.Pinned,
@@ -165,8 +176,128 @@ func (q *Queries) FindSongBySource(ctx context.Context, arg FindSongBySourcePara
 	return i, err
 }
 
+const findSongsByExactName = `-- name: FindSongsByExactName :many
+SELECT id, name, name_normalized, name_romanized, duration_ms, image_id, pinned, created_at, updated_at FROM songs WHERE name = $1
+`
+
+func (q *Queries) FindSongsByExactName(ctx context.Context, name string) ([]Song, error) {
+	rows, err := q.db.Query(ctx, findSongsByExactName, name)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Song
+	for rows.Next() {
+		var i Song
+		if err := rows.Scan(
+			&i.ID,
+			&i.Name,
+			&i.NameNormalized,
+			&i.NameRomanized,
+			&i.DurationMs,
+			&i.ImageID,
+			&i.Pinned,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const findSongsByExactNameForArtists = `-- name: FindSongsByExactNameForArtists :many
+SELECT DISTINCT s.id, s.name, s.name_normalized, s.name_romanized, s.duration_ms, s.image_id, s.pinned, s.created_at, s.updated_at FROM songs s
+JOIN song_artists sa ON sa.song_id = s.id
+WHERE s.name = $1::text AND sa.artist_id = ANY($2::bigint[])
+`
+
+type FindSongsByExactNameForArtistsParams struct {
+	Name      string  `json:"name"`
+	ArtistIds []int64 `json:"artist_ids"`
+}
+
+func (q *Queries) FindSongsByExactNameForArtists(ctx context.Context, arg FindSongsByExactNameForArtistsParams) ([]Song, error) {
+	rows, err := q.db.Query(ctx, findSongsByExactNameForArtists, arg.Name, arg.ArtistIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Song
+	for rows.Next() {
+		var i Song
+		if err := rows.Scan(
+			&i.ID,
+			&i.Name,
+			&i.NameNormalized,
+			&i.NameRomanized,
+			&i.DurationMs,
+			&i.ImageID,
+			&i.Pinned,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const findSongsByExactNameForArtistsAndAlbum = `-- name: FindSongsByExactNameForArtistsAndAlbum :many
+SELECT DISTINCT s.id, s.name, s.name_normalized, s.name_romanized, s.duration_ms, s.image_id, s.pinned, s.created_at, s.updated_at FROM songs s
+JOIN song_artists sa ON sa.song_id = s.id
+JOIN song_albums sal ON sal.song_id = s.id
+WHERE s.name = $1::text
+  AND sa.artist_id = ANY($2::bigint[])
+  AND sal.album_id = $3::bigint
+`
+
+type FindSongsByExactNameForArtistsAndAlbumParams struct {
+	Name      string  `json:"name"`
+	ArtistIds []int64 `json:"artist_ids"`
+	AlbumID   int64   `json:"album_id"`
+}
+
+func (q *Queries) FindSongsByExactNameForArtistsAndAlbum(ctx context.Context, arg FindSongsByExactNameForArtistsAndAlbumParams) ([]Song, error) {
+	rows, err := q.db.Query(ctx, findSongsByExactNameForArtistsAndAlbum, arg.Name, arg.ArtistIds, arg.AlbumID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Song
+	for rows.Next() {
+		var i Song
+		if err := rows.Scan(
+			&i.ID,
+			&i.Name,
+			&i.NameNormalized,
+			&i.NameRomanized,
+			&i.DurationMs,
+			&i.ImageID,
+			&i.Pinned,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const getAlbumForSong = `-- name: GetAlbumForSong :one
-SELECT al.id, al.name, al.name_normalized, al.release_date, al.description, al.image_id, al.pinned, al.created_at, al.updated_at, sal.track_number FROM albums al
+SELECT al.id, al.name, al.name_normalized, al.name_romanized, al.release_date, al.description, al.image_id, al.pinned, al.created_at, al.updated_at, sal.track_number FROM albums al
 JOIN song_albums sal ON sal.album_id = al.id
 WHERE sal.song_id = $1
 LIMIT 1
@@ -176,6 +307,7 @@ type GetAlbumForSongRow struct {
 	ID             int64              `json:"id"`
 	Name           string             `json:"name"`
 	NameNormalized string             `json:"name_normalized"`
+	NameRomanized  string             `json:"name_romanized"`
 	ReleaseDate    pgtype.Date        `json:"release_date"`
 	Description    *string            `json:"description"`
 	ImageID        pgtype.UUID        `json:"image_id"`
@@ -192,6 +324,7 @@ func (q *Queries) GetAlbumForSong(ctx context.Context, songID int64) (GetAlbumFo
 		&i.ID,
 		&i.Name,
 		&i.NameNormalized,
+		&i.NameRomanized,
 		&i.ReleaseDate,
 		&i.Description,
 		&i.ImageID,
@@ -204,7 +337,7 @@ func (q *Queries) GetAlbumForSong(ctx context.Context, songID int64) (GetAlbumFo
 }
 
 const getSongByID = `-- name: GetSongByID :one
-SELECT id, name, name_normalized, duration_ms, image_id, pinned, created_at, updated_at FROM songs WHERE id = $1
+SELECT id, name, name_normalized, name_romanized, duration_ms, image_id, pinned, created_at, updated_at FROM songs WHERE id = $1
 `
 
 func (q *Queries) GetSongByID(ctx context.Context, id int64) (Song, error) {
@@ -214,6 +347,7 @@ func (q *Queries) GetSongByID(ctx context.Context, id int64) (Song, error) {
 		&i.ID,
 		&i.Name,
 		&i.NameNormalized,
+		&i.NameRomanized,
 		&i.DurationMs,
 		&i.ImageID,
 		&i.Pinned,
@@ -224,7 +358,7 @@ func (q *Queries) GetSongByID(ctx context.Context, id int64) (Song, error) {
 }
 
 const getSongsByIDs = `-- name: GetSongsByIDs :many
-SELECT id, name, name_normalized, duration_ms, image_id, pinned, created_at, updated_at FROM songs WHERE id = ANY($1::bigint[])
+SELECT id, name, name_normalized, name_romanized, duration_ms, image_id, pinned, created_at, updated_at FROM songs WHERE id = ANY($1::bigint[])
 `
 
 func (q *Queries) GetSongsByIDs(ctx context.Context, ids []int64) ([]Song, error) {
@@ -240,11 +374,60 @@ func (q *Queries) GetSongsByIDs(ctx context.Context, ids []int64) ([]Song, error
 			&i.ID,
 			&i.Name,
 			&i.NameNormalized,
+			&i.NameRomanized,
 			&i.DurationMs,
 			&i.ImageID,
 			&i.Pinned,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const getSongsPrimaryArtistAlbum = `-- name: GetSongsPrimaryArtistAlbum :many
+SELECT s.id AS song_id,
+       coalesce((SELECT ar.id FROM song_artists sa JOIN artists ar ON ar.id = sa.artist_id
+        WHERE sa.song_id = s.id ORDER BY sa.position LIMIT 1), 0)::bigint AS artist_id,
+       coalesce((SELECT ar.name FROM song_artists sa JOIN artists ar ON ar.id = sa.artist_id
+        WHERE sa.song_id = s.id ORDER BY sa.position LIMIT 1), '')::text AS artist_name,
+       coalesce((SELECT al.id FROM song_albums sal JOIN albums al ON al.id = sal.album_id
+        WHERE sal.song_id = s.id ORDER BY sal.track_number LIMIT 1), 0)::bigint AS album_id,
+       coalesce((SELECT al.name FROM song_albums sal JOIN albums al ON al.id = sal.album_id
+        WHERE sal.song_id = s.id ORDER BY sal.track_number LIMIT 1), '')::text AS album_name
+FROM songs s
+WHERE s.id = ANY($1::bigint[])
+`
+
+type GetSongsPrimaryArtistAlbumRow struct {
+	SongID     int64  `json:"song_id"`
+	ArtistID   int64  `json:"artist_id"`
+	ArtistName string `json:"artist_name"`
+	AlbumID    int64  `json:"album_id"`
+	AlbumName  string `json:"album_name"`
+}
+
+func (q *Queries) GetSongsPrimaryArtistAlbum(ctx context.Context, songIds []int64) ([]GetSongsPrimaryArtistAlbumRow, error) {
+	rows, err := q.db.Query(ctx, getSongsPrimaryArtistAlbum, songIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []GetSongsPrimaryArtistAlbumRow
+	for rows.Next() {
+		var i GetSongsPrimaryArtistAlbumRow
+		if err := rows.Scan(
+			&i.SongID,
+			&i.ArtistID,
+			&i.ArtistName,
+			&i.AlbumID,
+			&i.AlbumName,
 		); err != nil {
 			return nil, err
 		}
@@ -289,7 +472,7 @@ func (q *Queries) LinkSongArtist(ctx context.Context, arg LinkSongArtistParams) 
 }
 
 const listArtistsForSong = `-- name: ListArtistsForSong :many
-SELECT a.id, a.name, a.name_normalized, a.description, a.image_id, a.pinned, a.created_at, a.updated_at FROM artists a
+SELECT a.id, a.name, a.name_normalized, a.name_romanized, a.description, a.image_id, a.pinned, a.created_at, a.updated_at FROM artists a
 JOIN song_artists sa ON sa.artist_id = a.id
 WHERE sa.song_id = $1
 ORDER BY sa.position
@@ -308,6 +491,7 @@ func (q *Queries) ListArtistsForSong(ctx context.Context, songID int64) ([]Artis
 			&i.ID,
 			&i.Name,
 			&i.NameNormalized,
+			&i.NameRomanized,
 			&i.Description,
 			&i.ImageID,
 			&i.Pinned,
@@ -349,7 +533,7 @@ func (q *Queries) ListSongArtists(ctx context.Context, songID int64) ([]SongArti
 }
 
 const listSongs = `-- name: ListSongs :many
-SELECT id, name, name_normalized, duration_ms, image_id, pinned, created_at, updated_at FROM songs WHERE id > $1::bigint ORDER BY id LIMIT $2::int
+SELECT id, name, name_normalized, name_romanized, duration_ms, image_id, pinned, created_at, updated_at FROM songs WHERE id > $1::bigint ORDER BY id LIMIT $2::int
 `
 
 type ListSongsParams struct {
@@ -370,6 +554,7 @@ func (q *Queries) ListSongs(ctx context.Context, arg ListSongsParams) ([]Song, e
 			&i.ID,
 			&i.Name,
 			&i.NameNormalized,
+			&i.NameRomanized,
 			&i.DurationMs,
 			&i.ImageID,
 			&i.Pinned,
@@ -387,7 +572,7 @@ func (q *Queries) ListSongs(ctx context.Context, arg ListSongsParams) ([]Song, e
 }
 
 const listStaleSongs = `-- name: ListStaleSongs :many
-SELECT id, name, name_normalized, duration_ms, image_id, pinned, created_at, updated_at FROM songs WHERE updated_at < $1::timestamptz AND NOT pinned ORDER BY updated_at LIMIT $2::int
+SELECT id, name, name_normalized, name_romanized, duration_ms, image_id, pinned, created_at, updated_at FROM songs WHERE updated_at < $1::timestamptz AND NOT pinned ORDER BY updated_at LIMIT $2::int
 `
 
 type ListStaleSongsParams struct {
@@ -408,6 +593,7 @@ func (q *Queries) ListStaleSongs(ctx context.Context, arg ListStaleSongsParams) 
 			&i.ID,
 			&i.Name,
 			&i.NameNormalized,
+			&i.NameRomanized,
 			&i.DurationMs,
 			&i.ImageID,
 			&i.Pinned,
@@ -425,7 +611,7 @@ func (q *Queries) ListStaleSongs(ctx context.Context, arg ListStaleSongsParams) 
 }
 
 const setSongImage = `-- name: SetSongImage :one
-UPDATE songs SET image_id = $2, pinned = TRUE, updated_at = now() WHERE id = $1 RETURNING id, name, name_normalized, duration_ms, image_id, pinned, created_at, updated_at
+UPDATE songs SET image_id = $2, pinned = TRUE, updated_at = now() WHERE id = $1 RETURNING id, name, name_normalized, name_romanized, duration_ms, image_id, pinned, created_at, updated_at
 `
 
 type SetSongImageParams struct {
@@ -440,6 +626,7 @@ func (q *Queries) SetSongImage(ctx context.Context, arg SetSongImageParams) (Son
 		&i.ID,
 		&i.Name,
 		&i.NameNormalized,
+		&i.NameRomanized,
 		&i.DurationMs,
 		&i.ImageID,
 		&i.Pinned,
@@ -450,7 +637,7 @@ func (q *Queries) SetSongImage(ctx context.Context, arg SetSongImageParams) (Son
 }
 
 const setSongPinned = `-- name: SetSongPinned :one
-UPDATE songs SET pinned = $2 WHERE id = $1 RETURNING id, name, name_normalized, duration_ms, image_id, pinned, created_at, updated_at
+UPDATE songs SET pinned = $2 WHERE id = $1 RETURNING id, name, name_normalized, name_romanized, duration_ms, image_id, pinned, created_at, updated_at
 `
 
 type SetSongPinnedParams struct {
@@ -465,6 +652,7 @@ func (q *Queries) SetSongPinned(ctx context.Context, arg SetSongPinnedParams) (S
 		&i.ID,
 		&i.Name,
 		&i.NameNormalized,
+		&i.NameRomanized,
 		&i.DurationMs,
 		&i.ImageID,
 		&i.Pinned,
@@ -475,22 +663,29 @@ func (q *Queries) SetSongPinned(ctx context.Context, arg SetSongPinnedParams) (S
 }
 
 const updateSong = `-- name: UpdateSong :one
-UPDATE songs SET name = $2, name_normalized = $3, pinned = TRUE, updated_at = now() WHERE id = $1 RETURNING id, name, name_normalized, duration_ms, image_id, pinned, created_at, updated_at
+UPDATE songs SET name = $2, name_normalized = $3, name_romanized = $4, pinned = TRUE, updated_at = now() WHERE id = $1 RETURNING id, name, name_normalized, name_romanized, duration_ms, image_id, pinned, created_at, updated_at
 `
 
 type UpdateSongParams struct {
 	ID             int64  `json:"id"`
 	Name           string `json:"name"`
 	NameNormalized string `json:"name_normalized"`
+	NameRomanized  string `json:"name_romanized"`
 }
 
 func (q *Queries) UpdateSong(ctx context.Context, arg UpdateSongParams) (Song, error) {
-	row := q.db.QueryRow(ctx, updateSong, arg.ID, arg.Name, arg.NameNormalized)
+	row := q.db.QueryRow(ctx, updateSong,
+		arg.ID,
+		arg.Name,
+		arg.NameNormalized,
+		arg.NameRomanized,
+	)
 	var i Song
 	err := row.Scan(
 		&i.ID,
 		&i.Name,
 		&i.NameNormalized,
+		&i.NameRomanized,
 		&i.DurationMs,
 		&i.ImageID,
 		&i.Pinned,

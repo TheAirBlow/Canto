@@ -151,6 +151,10 @@ func (s *Server) recomputeStats(w http.ResponseWriter, r *http.Request) {
 			slog.Error("admin: stats recompute failed", "err", err)
 			return
 		}
+		if err := s.stats.InvalidateAll(ctx); err != nil {
+			slog.Error("admin: stats cache invalidate failed", "err", err)
+			return
+		}
 		slog.Info("admin: stats recompute finished")
 	}()
 

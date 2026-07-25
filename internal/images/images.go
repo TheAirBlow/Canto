@@ -2,11 +2,12 @@ package images
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"image"
 	_ "image/gif"
-	"image/jpeg"
+	_ "image/jpeg"
 	_ "image/png"
 	"io"
 	"io/fs"
@@ -16,13 +17,14 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/chai2010/webp"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 	"golang.org/x/image/draw"
-	"golang.org/x/image/webp"
 
 	"Canto/internal/config"
 	"Canto/internal/db"
+	"Canto/internal/httpx"
 )
 
 // Size names a resize target, or SizeSource for the cached original crop.
@@ -53,15 +55,13 @@ func (s Size) px() int {
 	}
 }
 
-var httpClient = &http.Client{Timeout: 15 * time.Second}
+var httpClient = httpx.NewImageClient(10 * time.Second)
 
 // Download fetches url, center-crops it to a square, and caches it under id at source quality.
-func Download(id uuid.UUID, url string) error {
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
-		return fmt.Errorf("images: download: %w", err)
-	}
-	resp, err := httpClient.Do(req)
+func Download(ctx context.Context, id uuid.UUID, url string) error {
+	resp, err := httpx.Do(ctx, httpClient, httpx.OKOrNotFound, func() (*http.Request, error) {
+		return http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	})
 	if err != nil {
 		return fmt.Errorf("images: download: %w", err)
 	}
@@ -69,11 +69,7 @@ func Download(id uuid.UUID, url string) error {
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("images: download: status %d", resp.StatusCode)
 	}
-
-	if err := saveResized(id, SizeSource, resp.Body); err != nil {
-		return fmt.Errorf("images: download: %w", err)
-	}
-	return nil
+	return saveResized(id, SizeSource, resp.Body)
 }
 
 // Store crops and caches an uploaded image under id at source quality, same as Download but from local bytes.
@@ -86,7 +82,7 @@ func Store(id uuid.UUID, r io.Reader) error {
 
 // Path returns the on-disk path id's cached image at size would live at, downloaded or not.
 func Path(id uuid.UUID, size Size) string {
-	return filepath.Join(config.DataDir, cacheDir, id.String()[:2], id.String(), string(size)+".jpg")
+	return filepath.Join(config.DataDir, cacheDir, id.String()[:2], id.String(), string(size)+".webp")
 }
 
 // Get returns the path to id's image at size, resizing and caching it from the source crop on first request.
@@ -134,7 +130,7 @@ func DeleteIfSet(id pgtype.UUID) {
 	}
 }
 
-// saveResized decodes data, center-crops it to a square, resizes it to size, and writes it as JPEG to id's cache path.
+// saveResized decodes data, center-crops it to a square, resizes it to size, and writes it as WebP to id's cache path.
 func saveResized(id uuid.UUID, size Size, data io.Reader) error {
 	img, err := decode(data)
 	if err != nil {
@@ -160,7 +156,7 @@ func saveResized(id uuid.UUID, size Size, data io.Reader) error {
 	}
 	defer f.Close()
 
-	if err := jpeg.Encode(f, dst, &jpeg.Options{Quality: 90}); err != nil {
+	if err := webp.Encode(f, dst, &webp.Options{Quality: 80}); err != nil {
 		return fmt.Errorf("encode: %w", err)
 	}
 	return nil

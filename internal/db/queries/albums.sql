@@ -10,19 +10,27 @@ JOIN sources s ON s.entity_type = 'album' AND s.entity_id = a.id
 WHERE s.source_type = $1 AND s.extracted_id = $2;
 
 -- name: FindAlbumByExactName :one
-SELECT * FROM albums WHERE name = $1 OR name_normalized = $1 LIMIT 1;
+SELECT * FROM albums WHERE name = $1 LIMIT 1;
 
 -- name: FindAlbumByExactNameForArtists :one
 SELECT a.* FROM albums a
 JOIN album_artists aa ON aa.album_id = a.id
-WHERE (a.name = sqlc.arg(name)::text OR a.name_normalized = sqlc.arg(name)::text) AND aa.artist_id = ANY(sqlc.arg(artist_ids)::bigint[])
+WHERE a.name = sqlc.arg(name)::text AND aa.artist_id = ANY(sqlc.arg(artist_ids)::bigint[])
 LIMIT 1;
 
+-- name: FindAlbumsByExactName :many
+SELECT * FROM albums WHERE name = $1;
+
+-- name: FindAlbumsByExactNameForArtists :many
+SELECT DISTINCT a.* FROM albums a
+JOIN album_artists aa ON aa.album_id = a.id
+WHERE a.name = sqlc.arg(name)::text AND aa.artist_id = ANY(sqlc.arg(artist_ids)::bigint[]);
+
 -- name: CreateAlbum :one
-INSERT INTO albums (name, name_normalized, release_date) VALUES ($1, $2, $3) RETURNING *;
+INSERT INTO albums (name, name_normalized, name_romanized, release_date) VALUES ($1, $2, $3, $4) RETURNING *;
 
 -- name: UpdateAlbum :one
-UPDATE albums SET name = $2, name_normalized = $3, description = $4, pinned = TRUE, updated_at = now() WHERE id = $1 RETURNING *;
+UPDATE albums SET name = $2, name_normalized = $3, name_romanized = $4, description = $5, pinned = TRUE, updated_at = now() WHERE id = $1 RETURNING *;
 
 -- name: SetAlbumImage :one
 UPDATE albums SET image_id = $2, pinned = TRUE, updated_at = now() WHERE id = $1 RETURNING *;
@@ -63,3 +71,6 @@ SELECT s.*, sal.track_number FROM songs s
 JOIN song_albums sal ON sal.song_id = s.id
 WHERE sal.album_id = $1
 ORDER BY sal.track_number NULLS LAST, s.name;
+
+-- name: ListSongIDsForAlbum :many
+SELECT song_id FROM song_albums WHERE album_id = $1;

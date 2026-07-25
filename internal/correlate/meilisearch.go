@@ -3,46 +3,46 @@ package correlate
 import (
 	"context"
 	"fmt"
-	"strconv"
-	"strings"
 
 	"Canto/internal/search"
 )
 
-// MeilisearchMatcher matches an entity via the shared Meilisearch search client.
+// MeilisearchMatcher matches candidates via the shared Meilisearch search client.
 type MeilisearchMatcher struct {
 	client *search.Client
+	limit  int
 }
 
-// NewMeilisearchMatcher builds a MeilisearchMatcher against client.
-func NewMeilisearchMatcher(client *search.Client) *MeilisearchMatcher {
-	return &MeilisearchMatcher{client: client}
+// NewMeilisearchMatcher builds a MeilisearchMatcher against client, retrieving up to limit hits per query name.
+func NewMeilisearchMatcher(client *search.Client, limit int) *MeilisearchMatcher {
+	return &MeilisearchMatcher{client: client, limit: limit}
 }
 
 // ID identifies this matcher in configured matcher-order lists.
 func (m *MeilisearchMatcher) ID() string { return "meilisearch" }
 
-// Match searches the index for name, scoped by artistIDs/albumID when given, returning the top hit's id.
-func (m *MeilisearchMatcher) Match(ctx context.Context, entityType, name string, artistIDs []int64, albumID *int64) (int64, bool, error) {
-	var clauses []string
-	if entityType != "artist" && len(artistIDs) > 0 {
-		ids := make([]string, len(artistIDs))
-		for i, id := range artistIDs {
-			ids[i] = strconv.FormatInt(id, 10)
-		}
-		clauses = append(clauses, fmt.Sprintf("artist_ids IN [%s]", strings.Join(ids, ", ")))
-	}
-	if entityType == "song" && albumID != nil {
-		clauses = append(clauses, fmt.Sprintf("album_id = %d", *albumID))
-	}
-	filter := strings.Join(clauses, " AND ")
+// Available reports whether the backing Meilisearch client is configured.
+func (m *MeilisearchMatcher) Available() bool { return m.client.Enabled() }
 
-	hits, err := m.client.Search(ctx, entityType+"s", name, filter, 1)
-	if err != nil {
-		return 0, false, fmt.Errorf("meilisearch: match: %w", err)
+// Candidates searches the index for every name in q.Names, unfiltered by artist/album.
+func (m *MeilisearchMatcher) Candidates(ctx context.Context, entityType string, q Query) ([]Candidate, error) {
+	seen := make(map[int64]bool)
+	var out []Candidate
+	for _, name := range q.Names {
+		if name == "" {
+			continue
+		}
+		hits, err := m.client.Search(ctx, entityType+"s", name, "", m.limit)
+		if err != nil {
+			return nil, fmt.Errorf("meilisearch: candidates: %w", err)
+		}
+		for _, hit := range hits {
+			if seen[hit.ID] {
+				continue
+			}
+			seen[hit.ID] = true
+			out = append(out, Candidate{EntityID: hit.ID, Source: m.ID(), Hint: hit.RankingScore})
+		}
 	}
-	if len(hits) == 0 {
-		return 0, false, nil
-	}
-	return hits[0].ID, true, nil
+	return out, nil
 }

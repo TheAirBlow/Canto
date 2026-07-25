@@ -25,6 +25,9 @@ func (l *Lookup) Artist(ctx context.Context, artistID int64) (source.ArtistMetad
 		if !processor.State(ctx).CanFetchArtist {
 			continue
 		}
+		if a, ok := processor.(source.Availabler); ok && !a.Available() {
+			continue
+		}
 		meta, err := processor.FetchArtist(ctx, extractedID)
 		if err != nil {
 			slog.Warn("enrich: fetch artist failed", "processor", processor.ID(), "id", extractedID, "err", err)

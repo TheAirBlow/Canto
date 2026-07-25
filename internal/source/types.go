@@ -26,6 +26,15 @@ type ArtistMetadata struct {
 	Description  string
 }
 
+// Names returns artists' names, in order.
+func Names(artists []ArtistMetadata) []string {
+	names := make([]string, len(artists))
+	for i, a := range artists {
+		names[i] = a.Name
+	}
+	return names
+}
+
 // AlbumTrack is one track in an album's listing, as returned by FetchAlbum.
 type AlbumTrack struct {
 	Name         string
@@ -68,6 +77,11 @@ type State struct {
 	CanLookup      bool // Can search by artist/album/song text via FetchMetadataByQuery
 	CanFetchAlbum  bool // Can resolve an album id into full metadata via FetchAlbum
 	CanFetchArtist bool // Can resolve an artist id into full metadata via FetchArtist
+}
+
+// Availabler is implemented by processors whose availability can change at runtime.
+type Availabler interface {
+	Available() bool
 }
 
 // Processor detects, extracts, and enriches listens originating from one platform.

@@ -24,6 +24,10 @@ type rewindResult struct {
 	TopTracks       []rewindEntry `json:"top_tracks"`
 	MinutesListened float64       `json:"minutes_listened"`
 	Plays           int64         `json:"plays"`
+	UniqueTracks    int64         `json:"unique_tracks"`
+	UniqueAlbums    int64         `json:"unique_albums"`
+	UniqueArtists   int64         `json:"unique_artists"`
+	AvgDailyPlays   float64       `json:"avg_daily_plays"`
 	NewTracks       int64         `json:"new_tracks"`
 	NewAlbums       int64         `json:"new_albums"`
 	NewArtists      int64         `json:"new_artists"`
@@ -79,18 +83,20 @@ func (e *Engine) computeRewind(ctx context.Context, userID int64, from, to time.
 	return rewindResult{
 		TopArtists: artists, TopAlbums: albums, TopTracks: tracks,
 		MinutesListened: summary.MinutesListened, Plays: summary.ListenCount,
-		NewTracks: newCounts.NewTracks, NewAlbums: newCounts.NewAlbums, NewArtists: newCounts.NewArtists,
+		UniqueTracks: summary.UniqueTracks, UniqueAlbums: summary.UniqueAlbums, UniqueArtists: summary.UniqueArtists,
+		AvgDailyPlays: summary.AvgDailyPlays,
+		NewTracks:     newCounts.NewTracks, NewAlbums: newCounts.NewAlbums, NewArtists: newCounts.NewArtists,
 		TopDay: topDay, LongestStreak: summary.LongestStreak,
 	}, nil
 }
 
 // rewindLeaderboard fetches kind's top rewindTopLimit entries for [from, to) and their prior-period deltas.
 func (e *Engine) rewindLeaderboard(ctx context.Context, userID int64, kind TopKind, from, to, priorFrom, priorTo time.Time) ([]rewindEntry, error) {
-	current, err := e.computeTop(ctx, &userID, kind, from, to, nil, nil, 1, rewindTopLimit)
+	current, err := e.computeTop(ctx, &userID, kind, from, to, nil, nil, 1, rewindTopLimit, "listens")
 	if err != nil {
 		return nil, err
 	}
-	prior, err := e.computeTop(ctx, &userID, kind, priorFrom, priorTo, nil, nil, 1, 1000)
+	prior, err := e.computeTop(ctx, &userID, kind, priorFrom, priorTo, nil, nil, 1, 1000, "listens")
 	if err != nil {
 		return nil, err
 	}

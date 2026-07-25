@@ -18,6 +18,8 @@ const (
 	ImportServiceMaloja       ImportService = "maloja"
 	ImportServiceCantoExport  ImportService = "canto_export"
 	ImportServiceKoito        ImportService = "koito"
+	// ImportServiceIngestBatch is an oversized live submission, redirected into a job by the ListenBrainz endpoint itself.
+	ImportServiceIngestBatch ImportService = "ingest_batch"
 )
 
 // Format translates one bulk-import file format into ListenInput entries.
@@ -39,6 +41,7 @@ func defaultFormats() map[ImportService]Format {
 		newMalojaFormat(),
 		newYTMusicFormat(),
 		newKoitoFormat(),
+		newIngestBatchFormat(),
 	}
 	out := make(map[ImportService]Format, len(formats))
 	for _, f := range formats {

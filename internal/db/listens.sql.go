@@ -11,34 +11,105 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const countListensForAlbum = `-- name: CountListensForAlbum :one
-SELECT count(*) FROM listens l JOIN song_albums sa ON sa.song_id = l.song_id WHERE sa.album_id = $1::bigint
+const countListensAllFiltered = `-- name: CountListensAllFiltered :one
+SELECT count(*) FROM listens l
+WHERE l.listened_at >= $1::timestamptz
+  AND l.listened_at < $2::timestamptz
+  AND ($3::bigint IS NULL OR l.song_id = $3::bigint)
+  AND ($4::bigint IS NULL OR EXISTS (
+        SELECT 1 FROM song_albums sa WHERE sa.song_id = l.song_id AND sa.album_id = $4::bigint))
+  AND ($5::bigint IS NULL OR EXISTS (
+        SELECT 1 FROM song_artists sar WHERE sar.song_id = l.song_id AND sar.artist_id = $5::bigint))
+  AND ($6::text IS NULL OR EXISTS (
+        SELECT 1 FROM sources src WHERE src.entity_type = 'song' AND src.entity_id = l.song_id AND src.source_type = $6::text))
 `
 
-func (q *Queries) CountListensForAlbum(ctx context.Context, albumID int64) (int64, error) {
-	row := q.db.QueryRow(ctx, countListensForAlbum, albumID)
+type CountListensAllFilteredParams struct {
+	FromTime   pgtype.Timestamptz `json:"from_time"`
+	ToTime     pgtype.Timestamptz `json:"to_time"`
+	SongID     *int64             `json:"song_id"`
+	AlbumID    *int64             `json:"album_id"`
+	ArtistID   *int64             `json:"artist_id"`
+	SourceType *string            `json:"source_type"`
+}
+
+func (q *Queries) CountListensAllFiltered(ctx context.Context, arg CountListensAllFilteredParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countListensAllFiltered,
+		arg.FromTime,
+		arg.ToTime,
+		arg.SongID,
+		arg.AlbumID,
+		arg.ArtistID,
+		arg.SourceType,
+	)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
+const countListensForAlbum = `-- name: CountListensForAlbum :one
+SELECT count(*) FROM listens l
+JOIN songs s ON s.id = l.song_id
+JOIN song_albums sa ON sa.song_id = l.song_id
+WHERE sa.album_id = $1::bigint
+  AND ($2::bigint IS NULL OR l.user_id = $2::bigint)
+  AND (s.duration_ms IS NULL OR s.duration_ms <= 0
+       OR coalesce(l.duration_played_ms, s.duration_ms, 0) * 2 >= s.duration_ms
+       OR coalesce(l.duration_played_ms, s.duration_ms, 0) >= 240000)
+`
+
+type CountListensForAlbumParams struct {
+	AlbumID int64  `json:"album_id"`
+	UserID  *int64 `json:"user_id"`
+}
+
+func (q *Queries) CountListensForAlbum(ctx context.Context, arg CountListensForAlbumParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countListensForAlbum, arg.AlbumID, arg.UserID)
 	var count int64
 	err := row.Scan(&count)
 	return count, err
 }
 
 const countListensForArtist = `-- name: CountListensForArtist :one
-SELECT count(*) FROM listens l JOIN song_artists sar ON sar.song_id = l.song_id WHERE sar.artist_id = $1::bigint
+SELECT count(*) FROM listens l
+JOIN songs s ON s.id = l.song_id
+JOIN song_artists sar ON sar.song_id = l.song_id
+WHERE sar.artist_id = $1::bigint
+  AND ($2::bigint IS NULL OR l.user_id = $2::bigint)
+  AND (s.duration_ms IS NULL OR s.duration_ms <= 0
+       OR coalesce(l.duration_played_ms, s.duration_ms, 0) * 2 >= s.duration_ms
+       OR coalesce(l.duration_played_ms, s.duration_ms, 0) >= 240000)
 `
 
-func (q *Queries) CountListensForArtist(ctx context.Context, artistID int64) (int64, error) {
-	row := q.db.QueryRow(ctx, countListensForArtist, artistID)
+type CountListensForArtistParams struct {
+	ArtistID int64  `json:"artist_id"`
+	UserID   *int64 `json:"user_id"`
+}
+
+func (q *Queries) CountListensForArtist(ctx context.Context, arg CountListensForArtistParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countListensForArtist, arg.ArtistID, arg.UserID)
 	var count int64
 	err := row.Scan(&count)
 	return count, err
 }
 
 const countListensForSong = `-- name: CountListensForSong :one
-SELECT count(*) FROM listens WHERE song_id = $1::bigint
+SELECT count(*) FROM listens l
+JOIN songs s ON s.id = l.song_id
+WHERE l.song_id = $1::bigint
+  AND ($2::bigint IS NULL OR l.user_id = $2::bigint)
+  AND (s.duration_ms IS NULL OR s.duration_ms <= 0
+       OR coalesce(l.duration_played_ms, s.duration_ms, 0) * 2 >= s.duration_ms
+       OR coalesce(l.duration_played_ms, s.duration_ms, 0) >= 240000)
 `
 
-func (q *Queries) CountListensForSong(ctx context.Context, songID int64) (int64, error) {
-	row := q.db.QueryRow(ctx, countListensForSong, songID)
+type CountListensForSongParams struct {
+	SongID int64  `json:"song_id"`
+	UserID *int64 `json:"user_id"`
+}
+
+func (q *Queries) CountListensForSong(ctx context.Context, arg CountListensForSongParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countListensForSong, arg.SongID, arg.UserID)
 	var count int64
 	err := row.Scan(&count)
 	return count, err
@@ -86,6 +157,7 @@ func (q *Queries) CountListensForUserFiltered(ctx context.Context, arg CountList
 const createListen = `-- name: CreateListen :one
 INSERT INTO listens (user_id, song_id, listened_at, client, duration_played_ms, extra)
 VALUES ($1, $2, $3, $4, $5, $6)
+ON CONFLICT (user_id, song_id, listened_at) DO NOTHING
 RETURNING id, user_id, song_id, listened_at, client, duration_played_ms, extra, created_at
 `
 
@@ -98,6 +170,8 @@ type CreateListenParams struct {
 	Extra            []byte             `json:"extra"`
 }
 
+// ON CONFLICT DO NOTHING absorbs a client retry or a re-run bulk import resubmitting the exact
+// same listen; the caller sees pgx.ErrNoRows and treats it as an already-recorded no-op.
 func (q *Queries) CreateListen(ctx context.Context, arg CreateListenParams) (Listen, error) {
 	row := q.db.QueryRow(ctx, createListen,
 		arg.UserID,
@@ -121,20 +195,146 @@ func (q *Queries) CreateListen(ctx context.Context, arg CreateListenParams) (Lis
 	return i, err
 }
 
+const deleteListenForUser = `-- name: DeleteListenForUser :one
+DELETE FROM listens WHERE id = $1::bigint AND user_id = $2::bigint
+RETURNING id, song_id, listened_at, duration_played_ms
+`
+
+type DeleteListenForUserParams struct {
+	ID     int64 `json:"id"`
+	UserID int64 `json:"user_id"`
+}
+
+type DeleteListenForUserRow struct {
+	ID               int64              `json:"id"`
+	SongID           int64              `json:"song_id"`
+	ListenedAt       pgtype.Timestamptz `json:"listened_at"`
+	DurationPlayedMs *int32             `json:"duration_played_ms"`
+}
+
+func (q *Queries) DeleteListenForUser(ctx context.Context, arg DeleteListenForUserParams) (DeleteListenForUserRow, error) {
+	row := q.db.QueryRow(ctx, deleteListenForUser, arg.ID, arg.UserID)
+	var i DeleteListenForUserRow
+	err := row.Scan(
+		&i.ID,
+		&i.SongID,
+		&i.ListenedAt,
+		&i.DurationPlayedMs,
+	)
+	return i, err
+}
+
+const earliestListenedAt = `-- name: EarliestListenedAt :one
+SELECT min(listened_at)::timestamptz FROM listens
+WHERE $1::bigint IS NULL OR user_id = $1::bigint
+`
+
+func (q *Queries) EarliestListenedAt(ctx context.Context, userID *int64) (pgtype.Timestamptz, error) {
+	row := q.db.QueryRow(ctx, earliestListenedAt, userID)
+	var column_1 pgtype.Timestamptz
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
+const listListensAllFiltered = `-- name: ListListensAllFiltered :many
+SELECT l.id, l.song_id, l.listened_at, l.duration_played_ms, u.id AS user_id, u.public, u.username, u.display_name, u.image_id AS user_image_id
+FROM listens l
+JOIN users u ON u.id = l.user_id
+WHERE l.listened_at >= $1::timestamptz
+  AND l.listened_at < $2::timestamptz
+  AND ($3::bigint IS NULL OR l.song_id = $3::bigint)
+  AND ($4::bigint IS NULL OR EXISTS (
+        SELECT 1 FROM song_albums sa WHERE sa.song_id = l.song_id AND sa.album_id = $4::bigint))
+  AND ($5::bigint IS NULL OR EXISTS (
+        SELECT 1 FROM song_artists sar WHERE sar.song_id = l.song_id AND sar.artist_id = $5::bigint))
+  AND ($6::text IS NULL OR EXISTS (
+        SELECT 1 FROM sources src WHERE src.entity_type = 'song' AND src.entity_id = l.song_id AND src.source_type = $6::text))
+ORDER BY l.listened_at DESC
+LIMIT $8::int OFFSET $7::int
+`
+
+type ListListensAllFilteredParams struct {
+	FromTime   pgtype.Timestamptz `json:"from_time"`
+	ToTime     pgtype.Timestamptz `json:"to_time"`
+	SongID     *int64             `json:"song_id"`
+	AlbumID    *int64             `json:"album_id"`
+	ArtistID   *int64             `json:"artist_id"`
+	SourceType *string            `json:"source_type"`
+	RowOffset  int32              `json:"row_offset"`
+	MaxRows    int32              `json:"max_rows"`
+}
+
+type ListListensAllFilteredRow struct {
+	ID               int64              `json:"id"`
+	SongID           int64              `json:"song_id"`
+	ListenedAt       pgtype.Timestamptz `json:"listened_at"`
+	DurationPlayedMs *int32             `json:"duration_played_ms"`
+	UserID           int64              `json:"user_id"`
+	Public           bool               `json:"public"`
+	Username         string             `json:"username"`
+	DisplayName      *string            `json:"display_name"`
+	UserImageID      pgtype.UUID        `json:"user_image_id"`
+}
+
+func (q *Queries) ListListensAllFiltered(ctx context.Context, arg ListListensAllFilteredParams) ([]ListListensAllFilteredRow, error) {
+	rows, err := q.db.Query(ctx, listListensAllFiltered,
+		arg.FromTime,
+		arg.ToTime,
+		arg.SongID,
+		arg.AlbumID,
+		arg.ArtistID,
+		arg.SourceType,
+		arg.RowOffset,
+		arg.MaxRows,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListListensAllFilteredRow
+	for rows.Next() {
+		var i ListListensAllFilteredRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.SongID,
+			&i.ListenedAt,
+			&i.DurationPlayedMs,
+			&i.UserID,
+			&i.Public,
+			&i.Username,
+			&i.DisplayName,
+			&i.UserImageID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listListensForAlbum = `-- name: ListListensForAlbum :many
 SELECT l.id, l.song_id, l.listened_at, u.id AS user_id, u.public, u.username, u.display_name, u.image_id AS user_image_id
 FROM listens l
+JOIN songs s ON s.id = l.song_id
 JOIN song_albums sa ON sa.song_id = l.song_id
 JOIN users u ON u.id = l.user_id
 WHERE sa.album_id = $1::bigint
+  AND ($2::bigint IS NULL OR l.user_id = $2::bigint)
+  AND (s.duration_ms IS NULL OR s.duration_ms <= 0
+       OR coalesce(l.duration_played_ms, s.duration_ms, 0) * 2 >= s.duration_ms
+       OR coalesce(l.duration_played_ms, s.duration_ms, 0) >= 240000)
 ORDER BY l.listened_at DESC
-LIMIT $3::int OFFSET $2::int
+LIMIT $4::int OFFSET $3::int
 `
 
 type ListListensForAlbumParams struct {
-	AlbumID   int64 `json:"album_id"`
-	RowOffset int32 `json:"row_offset"`
-	MaxRows   int32 `json:"max_rows"`
+	AlbumID   int64  `json:"album_id"`
+	UserID    *int64 `json:"user_id"`
+	RowOffset int32  `json:"row_offset"`
+	MaxRows   int32  `json:"max_rows"`
 }
 
 type ListListensForAlbumRow struct {
@@ -148,8 +348,14 @@ type ListListensForAlbumRow struct {
 	UserImageID pgtype.UUID        `json:"user_image_id"`
 }
 
+// Eligibility-filtered; see ListListensForSong.
 func (q *Queries) ListListensForAlbum(ctx context.Context, arg ListListensForAlbumParams) ([]ListListensForAlbumRow, error) {
-	rows, err := q.db.Query(ctx, listListensForAlbum, arg.AlbumID, arg.RowOffset, arg.MaxRows)
+	rows, err := q.db.Query(ctx, listListensForAlbum,
+		arg.AlbumID,
+		arg.UserID,
+		arg.RowOffset,
+		arg.MaxRows,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -180,17 +386,23 @@ func (q *Queries) ListListensForAlbum(ctx context.Context, arg ListListensForAlb
 const listListensForArtist = `-- name: ListListensForArtist :many
 SELECT l.id, l.song_id, l.listened_at, u.id AS user_id, u.public, u.username, u.display_name, u.image_id AS user_image_id
 FROM listens l
+JOIN songs s ON s.id = l.song_id
 JOIN song_artists sar ON sar.song_id = l.song_id
 JOIN users u ON u.id = l.user_id
 WHERE sar.artist_id = $1::bigint
+  AND ($2::bigint IS NULL OR l.user_id = $2::bigint)
+  AND (s.duration_ms IS NULL OR s.duration_ms <= 0
+       OR coalesce(l.duration_played_ms, s.duration_ms, 0) * 2 >= s.duration_ms
+       OR coalesce(l.duration_played_ms, s.duration_ms, 0) >= 240000)
 ORDER BY l.listened_at DESC
-LIMIT $3::int OFFSET $2::int
+LIMIT $4::int OFFSET $3::int
 `
 
 type ListListensForArtistParams struct {
-	ArtistID  int64 `json:"artist_id"`
-	RowOffset int32 `json:"row_offset"`
-	MaxRows   int32 `json:"max_rows"`
+	ArtistID  int64  `json:"artist_id"`
+	UserID    *int64 `json:"user_id"`
+	RowOffset int32  `json:"row_offset"`
+	MaxRows   int32  `json:"max_rows"`
 }
 
 type ListListensForArtistRow struct {
@@ -204,8 +416,14 @@ type ListListensForArtistRow struct {
 	UserImageID pgtype.UUID        `json:"user_image_id"`
 }
 
+// Eligibility-filtered; see ListListensForSong.
 func (q *Queries) ListListensForArtist(ctx context.Context, arg ListListensForArtistParams) ([]ListListensForArtistRow, error) {
-	rows, err := q.db.Query(ctx, listListensForArtist, arg.ArtistID, arg.RowOffset, arg.MaxRows)
+	rows, err := q.db.Query(ctx, listListensForArtist,
+		arg.ArtistID,
+		arg.UserID,
+		arg.RowOffset,
+		arg.MaxRows,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -235,16 +453,23 @@ func (q *Queries) ListListensForArtist(ctx context.Context, arg ListListensForAr
 
 const listListensForSong = `-- name: ListListensForSong :many
 SELECT l.id, l.song_id, l.listened_at, u.id AS user_id, u.public, u.username, u.display_name, u.image_id AS user_image_id
-FROM listens l JOIN users u ON u.id = l.user_id
+FROM listens l
+JOIN songs s ON s.id = l.song_id
+JOIN users u ON u.id = l.user_id
 WHERE l.song_id = $1::bigint
+  AND ($2::bigint IS NULL OR l.user_id = $2::bigint)
+  AND (s.duration_ms IS NULL OR s.duration_ms <= 0
+       OR coalesce(l.duration_played_ms, s.duration_ms, 0) * 2 >= s.duration_ms
+       OR coalesce(l.duration_played_ms, s.duration_ms, 0) >= 240000)
 ORDER BY l.listened_at DESC
-LIMIT $3::int OFFSET $2::int
+LIMIT $4::int OFFSET $3::int
 `
 
 type ListListensForSongParams struct {
-	SongID    int64 `json:"song_id"`
-	RowOffset int32 `json:"row_offset"`
-	MaxRows   int32 `json:"max_rows"`
+	SongID    int64  `json:"song_id"`
+	UserID    *int64 `json:"user_id"`
+	RowOffset int32  `json:"row_offset"`
+	MaxRows   int32  `json:"max_rows"`
 }
 
 type ListListensForSongRow struct {
@@ -258,8 +483,16 @@ type ListListensForSongRow struct {
 	UserImageID pgtype.UUID        `json:"user_image_id"`
 }
 
+// Eligibility-filtered (rollup.Eligible's threshold) so this list, its count, and the song's
+// entity_global_stats.plays all agree on what counts as a real listen. user_id optionally
+// scopes to one caller-permitted user (already checked upstream).
 func (q *Queries) ListListensForSong(ctx context.Context, arg ListListensForSongParams) ([]ListListensForSongRow, error) {
-	rows, err := q.db.Query(ctx, listListensForSong, arg.SongID, arg.RowOffset, arg.MaxRows)
+	rows, err := q.db.Query(ctx, listListensForSong,
+		arg.SongID,
+		arg.UserID,
+		arg.RowOffset,
+		arg.MaxRows,
+	)
 	if err != nil {
 		return nil, err
 	}

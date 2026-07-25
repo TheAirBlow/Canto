@@ -12,16 +12,17 @@ import (
 	"Canto/internal/db"
 )
 
-// entitySummaryResult is stats.entity_summary's response payload: a catalog entity's stats across every user.
+// entitySummaryResult is stats.entity_summary's response payload: a catalog entity's stats, globally or for one user.
 type entitySummaryResult struct {
 	Plays           int64      `json:"plays"`
-	UniqueListeners int64      `json:"unique_listeners"`
+	UniqueListeners *int64     `json:"unique_listeners,omitempty"`
+	MinutesListened float64    `json:"minutes_listened"`
 	FirstListenedAt *time.Time `json:"first_listened_at,omitempty"`
 }
 
-// EntitySummary computes one catalog entity's global play count and unique listener count across every user.
-func (e *Engine) EntitySummary(ctx context.Context, entityType string, entityID int64) (json.RawMessage, error) {
-	key := cacheKey{Resource: db.StatsResourceSummary, Params: struct{}{}}
+// EntitySummary computes one catalog entity's play count and unique listener count, globally or for userID alone.
+func (e *Engine) EntitySummary(ctx context.Context, userID *int64, entityType string, entityID int64) (json.RawMessage, error) {
+	key := cacheKey{UserID: userID, Resource: db.StatsResourceSummary, Params: struct{}{}}
 	switch entityType {
 	case "artist":
 		key.ArtistID = &entityID
@@ -33,12 +34,16 @@ func (e *Engine) EntitySummary(ctx context.Context, entityType string, entityID 
 		return nil, fmt.Errorf("stats: invalid entity type %q", entityType)
 	}
 	return e.cached(ctx, key, func(ctx context.Context) (any, error) {
-		return e.computeEntitySummary(ctx, entityType, entityID)
+		return e.computeEntitySummary(ctx, userID, entityType, entityID)
 	})
 }
 
-// computeEntitySummary runs RollupEntitySummary for entityType.
-func (e *Engine) computeEntitySummary(ctx context.Context, entityType string, entityID int64) (entitySummaryResult, error) {
+// computeEntitySummary runs RollupEntitySummary for global scope, or a live per-user query for a scoped user.
+func (e *Engine) computeEntitySummary(ctx context.Context, userID *int64, entityType string, entityID int64) (entitySummaryResult, error) {
+	if userID != nil {
+		return e.computeEntityUserSummary(ctx, *userID, entityType, entityID)
+	}
+
 	var dbType db.EntityType
 	switch entityType {
 	case "artist":
@@ -56,7 +61,34 @@ func (e *Engine) computeEntitySummary(ctx context.Context, entityType string, en
 		return entitySummaryResult{}, err
 	}
 
-	result := entitySummaryResult{Plays: int64(row.Plays), UniqueListeners: int64(row.UniqueListeners)}
+	uniqueListeners := int64(row.UniqueListeners)
+	result := entitySummaryResult{Plays: int64(row.Plays), UniqueListeners: &uniqueListeners, MinutesListened: row.MinutesListened}
+	if row.FirstListenedAt.Valid {
+		result.FirstListenedAt = &row.FirstListenedAt.Time
+	}
+	return result, nil
+}
+
+// computeEntityUserSummary runs EntityUserSummary for one user's listens of entityType/entityID.
+func (e *Engine) computeEntityUserSummary(ctx context.Context, userID int64, entityType string, entityID int64) (entitySummaryResult, error) {
+	params := db.EntityUserSummaryParams{UserID: userID}
+	switch entityType {
+	case "artist":
+		params.ArtistID = &entityID
+	case "album":
+		params.AlbumID = &entityID
+	case "song":
+		params.SongID = &entityID
+	default:
+		return entitySummaryResult{}, fmt.Errorf("stats: invalid entity type %q", entityType)
+	}
+
+	row, err := e.queries.EntityUserSummary(ctx, params)
+	if err != nil {
+		return entitySummaryResult{}, err
+	}
+
+	result := entitySummaryResult{Plays: row.Plays, MinutesListened: row.MinutesListened}
 	if row.FirstListenedAt.Valid {
 		result.FirstListenedAt = &row.FirstListenedAt.Time
 	}

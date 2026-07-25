@@ -11,3 +11,6 @@ DELETE FROM sessions WHERE token_hash = $1;
 
 -- name: DeleteExpiredSessions :exec
 DELETE FROM sessions WHERE expires_at < now();
+
+-- name: DeleteOtherSessionsForUser :exec
+DELETE FROM sessions WHERE user_id = $1 AND token_hash != $2;

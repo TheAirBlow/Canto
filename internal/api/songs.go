@@ -1,7 +1,7 @@
 package api
 
 import (
-	"encoding/json"
+	"context"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -9,6 +9,7 @@ import (
 
 	"Canto/internal/auth"
 	"Canto/internal/correlate"
+	"Canto/internal/correlate/romanize"
 	"Canto/internal/db"
 	"Canto/internal/images"
 	"Canto/internal/search"
@@ -17,8 +18,10 @@ import (
 // registerSongs registers the song read and curation endpoints.
 func (s *Server) registerSongs(mux authMux) {
 	mux.HandleFunc("GET /songs/{id}", s.getSong)
+	mux.AdminAuthHandleFunc("GET /songs", s.listAllSongs)
 	mux.AdminAuthHandleFunc("PUT /songs/{id}", s.updateSong)
 	mux.AdminAuthHandleFunc("POST /songs/{id}/merge", s.mergeSong)
+	mux.AdminAuthHandleFunc("DELETE /songs/{id}", s.deleteSong)
 	mux.AdminAuthHandleFunc("PUT /songs/{id}/image", s.uploadSongImage)
 	mux.AdminAuthHandleFunc("PUT /songs/{id}/pin", s.pinSong)
 	mux.AdminAuthHandleFunc("DELETE /songs/{id}/pin", s.unpinSong)
@@ -26,8 +29,9 @@ func (s *Server) registerSongs(mux authMux) {
 	mux.HandleFunc("GET /songs/{id}/aliases", s.listSongAliases)
 	mux.AdminAuthHandleFunc("POST /songs/{id}/aliases", s.createSongAlias)
 	mux.AdminAuthHandleFunc("DELETE /songs/{id}/aliases/{alias_id}", s.deleteSongAlias)
-	mux.HandleFunc("GET /songs/{id}/listens", s.listSongListens)
-	mux.HandleFunc("GET /songs/{id}/now-playing", s.listSongNowPlaying)
+	mux.OptionalAuthHandleFunc("GET /songs/{id}/stats", s.getSongStats)
+	mux.OptionalAuthHandleFunc("GET /songs/{id}/listens", s.listSongListens)
+	mux.OptionalAuthHandleFunc("GET /songs/{id}/now-playing", s.listSongNowPlaying)
 }
 
 // songResponse is the public-facing song shape.
@@ -37,11 +41,53 @@ type songResponse struct {
 	DurationMs *int32  `json:"duration_ms,omitempty"`
 	ImageURL   *string `json:"image_url,omitempty"`
 	Pinned     bool    `json:"pinned"`
+	ArtistID   *int64  `json:"artist_id,omitempty"`
+	ArtistName *string `json:"artist_name,omitempty"`
+	AlbumID    *int64  `json:"album_id,omitempty"`
+	AlbumName  *string `json:"album_name,omitempty"`
 }
 
 // newSongResponse builds a songResponse from a db.Song.
 func newSongResponse(s db.Song) songResponse {
 	return songResponse{ID: s.ID, Name: s.Name, DurationMs: s.DurationMs, ImageURL: imageURL(s.ImageID), Pinned: s.Pinned}
+}
+
+// songPrimaryInfo is a song's first-billed artist and primary album; IDs are 0 when the song has none.
+type songPrimaryInfo struct {
+	ArtistID   int64
+	ArtistName string
+	AlbumID    int64
+	AlbumName  string
+}
+
+// songPrimaryInfoMap batch-fetches primary artist/album info for songIDs, keyed by song id.
+func (s *Server) songPrimaryInfoMap(ctx context.Context, songIDs []int64) (map[int64]songPrimaryInfo, error) {
+	rows, err := s.queries.GetSongsPrimaryArtistAlbum(ctx, songIDs)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[int64]songPrimaryInfo, len(rows))
+	for _, r := range rows {
+		out[r.SongID] = songPrimaryInfo{ArtistID: r.ArtistID, ArtistName: r.ArtistName, AlbumID: r.AlbumID, AlbumName: r.AlbumName}
+	}
+	return out, nil
+}
+
+// withPrimaryInfo fills resp's artist/album fields from info, leaving them unset if info has nothing for resp.ID.
+func withPrimaryInfo(resp songResponse, info map[int64]songPrimaryInfo) songResponse {
+	pi, ok := info[resp.ID]
+	if !ok {
+		return resp
+	}
+	if pi.ArtistID != 0 {
+		resp.ArtistID = &pi.ArtistID
+		resp.ArtistName = &pi.ArtistName
+	}
+	if pi.AlbumID != 0 {
+		resp.AlbumID = &pi.AlbumID
+		resp.AlbumName = &pi.AlbumName
+	}
+	return resp
 }
 
 // songDetailResponse is a song plus its artists and album, returned by GET /songs/{id}.
@@ -50,10 +96,9 @@ type songDetailResponse struct {
 	Artists     []artistResponse `json:"artists"`
 	Album       *albumResponse   `json:"album,omitempty"`
 	TrackNumber *int32           `json:"track_number,omitempty"`
-	Stats       json.RawMessage  `json:"stats,omitempty"`
 }
 
-// getSong returns a single song by id, with its artists, album, and global listening stats.
+// getSong returns a single song by id, with its artists and album.
 func (s *Server) getSong(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r)
 	if err != nil {
@@ -71,12 +116,8 @@ func (s *Server) getSong(w http.ResponseWriter, r *http.Request) {
 		internalError(w, err.Error())
 		return
 	}
-	stats, err := s.stats.EntitySummary(r.Context(), "song", id)
-	if err != nil {
-		slog.Warn("song stats fetch failed", "id", id, "err", err)
-	}
 
-	resp := songDetailResponse{songResponse: newSongResponse(song), Artists: make([]artistResponse, len(artists)), Stats: stats}
+	resp := songDetailResponse{songResponse: newSongResponse(song), Artists: make([]artistResponse, len(artists))}
 	for i, a := range artists {
 		resp.Artists[i] = newArtistResponse(a)
 	}
@@ -93,22 +134,66 @@ func (s *Server) getSong(w http.ResponseWriter, r *http.Request) {
 	ok(w, resp)
 }
 
-// listSongListens returns every listen of this song by any user, newest first, anonymizing private users.
+// getSongStats returns this song's listening stats, globally or scoped to one user via ?scope=.
+func (s *Server) getSongStats(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r)
+	if err != nil {
+		badRequest(w, err.Error())
+		return
+	}
+	userID, serr := s.resolveScope(r, scopeOrGlobal(r))
+	if serr != nil {
+		fail(w, serr.status, "stats scope", serr.detail)
+		return
+	}
+	stats, err := s.stats.EntitySummary(r.Context(), userID, "song", id)
+	if err != nil {
+		internalError(w, err.Error())
+		return
+	}
+	ok(w, stats)
+}
+
+// listAllSongs returns a cursor-paginated page of the full song catalog, ordered by id, for admin browsing.
+func (s *Server) listAllSongs(w http.ResponseWriter, r *http.Request) {
+	after, limit, err := parseCursorPage(r, catalogPageDefault, catalogPageMax)
+	if err != nil {
+		badRequest(w, err.Error())
+		return
+	}
+	rows, err := s.queries.ListSongs(r.Context(), db.ListSongsParams{After: after, MaxRows: int32(limit)})
+	if err != nil {
+		internalError(w, err.Error())
+		return
+	}
+	resp := make([]songResponse, len(rows))
+	for i, sg := range rows {
+		resp[i] = newSongResponse(sg)
+	}
+	ok(w, resp)
+}
+
+// listSongListens returns this song's listens, globally or scoped to one user via ?scope=, anonymizing private users.
 func (s *Server) listSongListens(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r)
 	if err != nil {
 		badRequest(w, err.Error())
 		return
 	}
+	userID, serr := s.resolveScope(r, scopeOrGlobal(r))
+	if serr != nil {
+		fail(w, serr.status, "stats scope", serr.detail)
+		return
+	}
 	page, perPage := parsePagination(r)
 	offset := int32((page - 1) * perPage)
 
-	rows, err := s.queries.ListListensForSong(r.Context(), db.ListListensForSongParams{SongID: id, MaxRows: int32(perPage), RowOffset: offset})
+	rows, err := s.queries.ListListensForSong(r.Context(), db.ListListensForSongParams{SongID: id, UserID: userID, MaxRows: int32(perPage), RowOffset: offset})
 	if err != nil {
 		internalError(w, err.Error())
 		return
 	}
-	total, err := s.queries.CountListensForSong(r.Context(), id)
+	total, err := s.queries.CountListensForSong(r.Context(), db.CountListensForSongParams{SongID: id, UserID: userID})
 	if err != nil {
 		internalError(w, err.Error())
 		return
@@ -117,21 +202,26 @@ func (s *Server) listSongListens(w http.ResponseWriter, r *http.Request) {
 	listens := make([]listenResponse, len(rows))
 	for i, row := range rows {
 		listens[i] = listenResponse{ListenedAt: row.ListenedAt.Time}
-		if row.Public {
+		if row.Public || userID != nil {
 			listens[i].User = &listenerResponse{ID: &row.UserID, Username: &row.Username, DisplayName: row.DisplayName, ImageURL: imageURL(row.UserImageID)}
 		}
 	}
 	ok(w, listensPage{Listens: listens, Total: total, Page: page, PerPage: perPage})
 }
 
-// listSongNowPlaying returns every public user currently listening to this song.
+// listSongNowPlaying returns who's currently listening to this song, globally or scoped to one user via ?scope=.
 func (s *Server) listSongNowPlaying(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r)
 	if err != nil {
 		badRequest(w, err.Error())
 		return
 	}
-	rows, err := s.queries.ListNowPlayingForSong(r.Context(), id)
+	userID, serr := s.resolveScope(r, scopeOrGlobal(r))
+	if serr != nil {
+		fail(w, serr.status, "stats scope", serr.detail)
+		return
+	}
+	rows, err := s.queries.ListNowPlayingForSong(r.Context(), db.ListNowPlayingForSongParams{SongID: id, UserID: userID})
 	if err != nil {
 		internalError(w, err.Error())
 		return
@@ -167,7 +257,7 @@ func (s *Server) updateSong(w http.ResponseWriter, r *http.Request) {
 	}
 
 	song, err := s.queries.UpdateSong(r.Context(), db.UpdateSongParams{
-		ID: id, Name: req.Name, NameNormalized: correlate.NormalizeName(req.Name),
+		ID: id, Name: req.Name, NameNormalized: correlate.NormalizeName(req.Name), NameRomanized: romanize.Romanize(req.Name),
 	})
 	if err != nil {
 		internalError(w, err.Error())
@@ -190,7 +280,7 @@ func (s *Server) updateSong(w http.ResponseWriter, r *http.Request) {
 		albumID, albumName = &album.ID, album.Name
 	}
 	s.search.Upsert(ctx, "songs", search.Document{
-		ID: song.ID, EntityType: "song", Name: song.Name, NameNormalized: song.NameNormalized,
+		ID: song.ID, EntityType: "song", Name: song.Name, NameNormalized: song.NameNormalized, NameRomanized: song.NameRomanized,
 		ArtistIDs: artistIDs, ArtistNames: artistNames, AlbumID: albumID, AlbumName: albumName,
 	})
 	slog.Info("admin: song updated", "admin", admin.Username, "id", song.ID, "name", song.Name)
@@ -225,39 +315,7 @@ func (s *Server) mergeSong(w http.ResponseWriter, r *http.Request) {
 	defer tx.Rollback(ctx)
 	q := s.queries.WithTx(tx)
 
-	if err := q.RepointSourcesForMerge(ctx, db.RepointSourcesForMergeParams{NewEntityID: req.Into, EntityType: db.EntityTypeSong, OldEntityID: oldID}); err != nil {
-		internalError(w, err.Error())
-		return
-	}
-	if err := q.RepointSongArtistsForSongMerge(ctx, db.RepointSongArtistsForSongMergeParams{NewSongID: req.Into, OldSongID: oldID}); err != nil {
-		internalError(w, err.Error())
-		return
-	}
-	if err := q.DeleteRemainingSongArtistsForSong(ctx, oldID); err != nil {
-		internalError(w, err.Error())
-		return
-	}
-	if err := q.RepointSongAlbumsForSongMerge(ctx, db.RepointSongAlbumsForSongMergeParams{NewSongID: req.Into, OldSongID: oldID}); err != nil {
-		internalError(w, err.Error())
-		return
-	}
-	if err := q.DeleteRemainingSongAlbumsForSong(ctx, oldID); err != nil {
-		internalError(w, err.Error())
-		return
-	}
-	if err := q.RepointListensForSongMerge(ctx, db.RepointListensForSongMergeParams{NewSongID: req.Into, OldSongID: oldID}); err != nil {
-		internalError(w, err.Error())
-		return
-	}
-	if err := q.RepointNowPlayingForSongMerge(ctx, db.RepointNowPlayingForSongMergeParams{NewSongID: req.Into, OldSongID: oldID}); err != nil {
-		internalError(w, err.Error())
-		return
-	}
-	if err := q.RepointAliases(ctx, db.RepointAliasesParams{EntityType: db.EntityTypeSong, OldEntityID: oldID, NewEntityID: req.Into}); err != nil {
-		internalError(w, err.Error())
-		return
-	}
-	if _, err := q.DeleteSong(ctx, oldID); err != nil {
+	if err := correlate.MergeEntity(ctx, q, db.EntityTypeSong, oldID, req.Into); err != nil {
 		internalError(w, err.Error())
 		return
 	}
@@ -268,6 +326,50 @@ func (s *Server) mergeSong(w http.ResponseWriter, r *http.Request) {
 
 	s.search.Delete(ctx, "songs", oldID)
 	slog.Info("admin: song merged", "admin", admin.Username, "from", oldID, "into", req.Into)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// deleteSong permanently removes a song and every row keyed to it.
+func (s *Server) deleteSong(w http.ResponseWriter, r *http.Request) {
+	admin, _ := auth.UserFromContext(r.Context())
+
+	id, err := pathID(r)
+	if err != nil {
+		badRequest(w, err.Error())
+		return
+	}
+
+	ctx := r.Context()
+	song, err := s.queries.GetSongByID(ctx, id)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		internalError(w, err.Error())
+		return
+	}
+	defer tx.Rollback(ctx)
+	q := s.queries.WithTx(tx)
+
+	if err := deletePolymorphicStats(ctx, q, db.EntityTypeSong, id); err != nil {
+		internalError(w, err.Error())
+		return
+	}
+	if _, err := q.DeleteSong(ctx, id); err != nil {
+		internalError(w, err.Error())
+		return
+	}
+	if err := tx.Commit(ctx); err != nil {
+		internalError(w, err.Error())
+		return
+	}
+
+	images.DeleteIfSet(song.ImageID)
+	s.search.Delete(ctx, "songs", id)
+	slog.Info("admin: song deleted", "admin", admin.Username, "id", id)
 	w.WriteHeader(http.StatusNoContent)
 }
 

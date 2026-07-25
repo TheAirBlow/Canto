@@ -117,10 +117,8 @@ http-client.private.env.json
 # Go build output
 /wirepirate
 
-# Runtime data (packet blobs, Postgres volume, pcap uploads)
-/db
-/blobs
-/pcaps
+# Runtime data (Postgres / Meilisearch / Config)
+/data
 
 # Frontend build staged for go:embed (see Dockerfile, internal/frontend/embed.go)
 /internal/frontend/dist/*

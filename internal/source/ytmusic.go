@@ -5,14 +5,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
+
+	"Canto/internal/httpx"
 )
 
 // ytmSongsFilterParam restricts a YTM search to the "Songs" category.
@@ -21,24 +21,15 @@ const ytmSongsFilterParam = "Eg-KAQwIARAAGAAgACgAMABqChAEEAMQCRAFEAo%3D"
 // durationPattern matches a bare "m:ss" or "h:mm:ss" duration run, e.g. from a track panel byline.
 var durationPattern = regexp.MustCompile(`^\d+(:\d+)+$`)
 
-// lockoutBase is the initial lockout duration on a suspected rate limit.
-const lockoutBase = 5 * time.Second
-
-// lockoutMax caps how long consecutive suspected rate limits can extend the lockout.
-const lockoutMax = 5 * time.Minute
-
 // youtubeProcessor covers YouTube and YouTube Music through internal YTM endpoints.
 type youtubeProcessor struct {
 	httpClient *http.Client
-
-	mu               sync.Mutex
-	lockedUntil      time.Time
-	consecutiveFails int
+	lockout    httpx.Lockout
 }
 
 // NewYouTubeProcessor builds the processor.
 func NewYouTubeProcessor() Processor {
-	return &youtubeProcessor{httpClient: &http.Client{Timeout: 10 * time.Second}}
+	return &youtubeProcessor{httpClient: httpx.NewExternalClient(10 * time.Second)}
 }
 
 // ID identifies this processor in configured processor-order lists.
@@ -76,33 +67,6 @@ func (p *youtubeProcessor) ExtractID(rawURL string) (string, error) {
 	return "", fmt.Errorf("youtube: no video id in %q", rawURL)
 }
 
-// checkLocked returns an error without making a network call if a suspected rate limit is still in effect.
-func (p *youtubeProcessor) checkLocked() error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if remaining := time.Until(p.lockedUntil); remaining > 0 {
-		return fmt.Errorf("youtube: locked out for %s after suspected rate limiting", remaining.Round(time.Second))
-	}
-	return nil
-}
-
-// lockOut engages an exponentially growing lockout after a suspected rate limit, logging reason.
-func (p *youtubeProcessor) lockOut(reason string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	dur := min(lockoutBase*(1<<p.consecutiveFails), lockoutMax)
-	p.lockedUntil = time.Now().Add(dur)
-	p.consecutiveFails++
-	slog.Warn("youtube: suspected rate limit, locking out", "reason", reason, "duration", dur, "consecutive", p.consecutiveFails)
-}
-
-// recover resets the consecutive-failure count after a fully successful response.
-func (p *youtubeProcessor) recover() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.consecutiveFails = 0
-}
-
 // innertubeContext is the WEB_REMIX client context YTM's internal endpoints expect.
 type innertubeContext struct {
 	Client struct {
@@ -131,29 +95,28 @@ func (p *youtubeProcessor) ytmCall(ctx context.Context, endpoint string, body an
 		return nil, err
 	}
 	reqURL := fmt.Sprintf("https://music.youtube.com/youtubei/v1/%s?alt=json", endpoint)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewReader(buf))
+	resp, err := httpx.DoLocked(ctx, p.httpClient, &p.lockout, httpx.OKOrNotFound, func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewReader(buf))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64; rv:152.0) Gecko/20100101 Firefox/152.0")
+		req.Header.Set("Accept", "*/*")
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Origin", "https://music.youtube.com")
+		return req, nil
+	})
 	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64; rv:152.0) Gecko/20100101 Firefox/152.0")
-	req.Header.Set("Accept", "*/*")
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Origin", "https://music.youtube.com")
-
-	resp, err := p.httpClient.Do(req)
-	if err != nil {
-		p.lockOut("transport error")
 		return nil, fmt.Errorf("youtube: ytm %s: %w", endpoint, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		p.lockOut(fmt.Sprintf("http status %d", resp.StatusCode))
 		return nil, fmt.Errorf("youtube: ytm %s: status %d", endpoint, resp.StatusCode)
 	}
 
 	var out map[string]any
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		p.lockOut("decode failure")
+		p.lockout.Trip("decode failure")
 		return nil, fmt.Errorf("youtube: ytm %s decode: %w", endpoint, err)
 	}
 	return out, nil
@@ -161,10 +124,6 @@ func (p *youtubeProcessor) ytmCall(ctx context.Context, endpoint string, body an
 
 // FetchMetadata fetches a video's title, duration, artists and album; confident reports whether it's catalog music rather than a plain video.
 func (p *youtubeProcessor) FetchMetadata(ctx context.Context, id string) (Metadata, bool, error) {
-	if err := p.checkLocked(); err != nil {
-		return Metadata{}, false, err
-	}
-
 	nextResp, err := p.ytmCall(ctx, "next", map[string]any{
 		"context":                       newInnertubeContext(),
 		"enablePersistentPlaylistPanel": true,
@@ -179,7 +138,7 @@ func (p *youtubeProcessor) FetchMetadata(ctx context.Context, id string) (Metada
 		"contents", "singleColumnMusicWatchNextResultsRenderer", "tabbedRenderer", "watchNextTabbedResultsRenderer",
 		"tabs", 0, "tabRenderer", "content", "musicQueueRenderer", "content", "playlistPanelRenderer", "contents")
 	if !ok {
-		p.lockOut("unexpected next response shape")
+		p.lockout.Trip("unexpected next response shape")
 		return Metadata{}, false, fmt.Errorf("youtube: unexpected next response shape for %s", id)
 	}
 
@@ -208,7 +167,7 @@ func (p *youtubeProcessor) FetchMetadata(ctx context.Context, id string) (Metada
 
 	title, ok := navString(trackData, "title", "runs", 0, "text")
 	if !ok {
-		p.lockOut("unexpected track title shape")
+		p.lockout.Trip("unexpected track title shape")
 		return Metadata{}, false, fmt.Errorf("youtube: unexpected track shape for %s", id)
 	}
 
@@ -226,16 +185,12 @@ func (p *youtubeProcessor) FetchMetadata(ctx context.Context, id string) (Metada
 
 	musicVideoType, _ := navString(trackData,
 		"navigationEndpoint", "watchEndpoint", "watchEndpointMusicSupportedConfigs", "watchEndpointMusicConfig", "musicVideoType")
-	p.recover()
+	p.lockout.Recover()
 	return meta, musicVideoType != "", nil
 }
 
 // FetchMetadataByQuery searches YTM for q's song/artist text and fetches full metadata for the top hit.
 func (p *youtubeProcessor) FetchMetadataByQuery(ctx context.Context, q Query) (Metadata, bool, error) {
-	if err := p.checkLocked(); err != nil {
-		return Metadata{}, false, err
-	}
-
 	terms := strings.TrimSpace(q.Song + " " + q.Artist)
 	if terms == "" {
 		return Metadata{}, false, fmt.Errorf("youtube: empty query")
@@ -257,10 +212,6 @@ func (p *youtubeProcessor) FetchMetadataByQuery(ctx context.Context, q Query) (M
 
 // FetchAlbum fetches an album's metadata and full track listing.
 func (p *youtubeProcessor) FetchAlbum(ctx context.Context, id string) (AlbumMetadata, error) {
-	if err := p.checkLocked(); err != nil {
-		return AlbumMetadata{}, err
-	}
-
 	browseResp, err := p.ytmCall(ctx, "browse", map[string]any{"context": newInnertubeContext(), "browseId": id})
 	if err != nil {
 		return AlbumMetadata{}, err
@@ -269,13 +220,13 @@ func (p *youtubeProcessor) FetchAlbum(ctx context.Context, id string) (AlbumMeta
 	header, ok := navMap(browseResp, "contents", "twoColumnBrowseResultsRenderer", "tabs", 0, "tabRenderer", "content",
 		"sectionListRenderer", "contents", 0, "musicResponsiveHeaderRenderer")
 	if !ok {
-		p.lockOut("unexpected album browse response shape")
+		p.lockout.Trip("unexpected album browse response shape")
 		return AlbumMetadata{}, fmt.Errorf("youtube: unexpected album browse response shape for %s", id)
 	}
 	shelf, ok := navMap(browseResp, "contents", "twoColumnBrowseResultsRenderer", "secondaryContents",
 		"sectionListRenderer", "contents", 0, "musicShelfRenderer")
 	if !ok {
-		p.lockOut("unexpected album browse response shape")
+		p.lockout.Trip("unexpected album browse response shape")
 		return AlbumMetadata{}, fmt.Errorf("youtube: unexpected album browse response shape for %s", id)
 	}
 
@@ -345,16 +296,12 @@ func (p *youtubeProcessor) FetchAlbum(ctx context.Context, id string) (AlbumMeta
 		})
 	}
 
-	p.recover()
+	p.lockout.Recover()
 	return AlbumMetadata{Name: albumName, ExtractedID: id, ThumbnailURL: thumbnailURL, Songs: tracks}, nil
 }
 
 // FetchArtist fetches an artist's profile metadata (name, description, thumbnail).
 func (p *youtubeProcessor) FetchArtist(ctx context.Context, id string) (ArtistMetadata, error) {
-	if err := p.checkLocked(); err != nil {
-		return ArtistMetadata{}, err
-	}
-
 	id = strings.TrimPrefix(id, "MPLA")
 
 	browseResp, err := p.ytmCall(ctx, "browse", map[string]any{"context": newInnertubeContext(), "browseId": id})
@@ -364,13 +311,13 @@ func (p *youtubeProcessor) FetchArtist(ctx context.Context, id string) (ArtistMe
 
 	header, ok := navMap(browseResp, "header", "musicImmersiveHeaderRenderer")
 	if !ok {
-		p.lockOut("unexpected artist browse response shape")
+		p.lockout.Trip("unexpected artist browse response shape")
 		return ArtistMetadata{}, fmt.Errorf("youtube: unexpected artist browse response shape for %s", id)
 	}
 	results, ok := navSlice(browseResp,
 		"contents", "singleColumnBrowseResultsRenderer", "tabs", 0, "tabRenderer", "content", "sectionListRenderer", "contents")
 	if !ok {
-		p.lockOut("unexpected artist browse response shape")
+		p.lockout.Trip("unexpected artist browse response shape")
 		return ArtistMetadata{}, fmt.Errorf("youtube: unexpected artist browse response shape for %s", id)
 	}
 
@@ -396,7 +343,7 @@ func (p *youtubeProcessor) FetchArtist(ctx context.Context, id string) (ArtistMe
 		thumbnailURL = bestThumbnail(thumbs)
 	}
 
-	p.recover()
+	p.lockout.Recover()
 	return ArtistMetadata{Name: name, ExtractedID: id, ThumbnailURL: thumbnailURL, Description: description}, nil
 }
 

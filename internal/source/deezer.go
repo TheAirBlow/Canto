@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"Canto/internal/httpx"
 )
 
 // deezerIDPattern matches a Deezer numeric entity id.
@@ -21,11 +23,12 @@ const deezerMaxTrackPages = 20
 // deezerProcessor resolves deezer.com track links and looks up track/album/artist metadata via Deezer's public API.
 type deezerProcessor struct {
 	httpClient *http.Client
+	lockout    httpx.Lockout
 }
 
 // NewDeezerProcessor builds the processor.
 func NewDeezerProcessor() Processor {
-	return &deezerProcessor{httpClient: &http.Client{Timeout: 10 * time.Second}}
+	return &deezerProcessor{httpClient: httpx.NewExternalClient(10 * time.Second)}
 }
 
 // ID identifies this processor in configured processor-order lists.
@@ -248,11 +251,9 @@ func (p *deezerProcessor) Type() SourceType { return SourceTypeDeezer }
 
 // get performs a GET request against reqURL and decodes the JSON response into out.
 func (p *deezerProcessor) get(ctx context.Context, reqURL string, out any) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
-	if err != nil {
-		return err
-	}
-	resp, err := p.httpClient.Do(req)
+	resp, err := httpx.DoLocked(ctx, p.httpClient, &p.lockout, httpx.OKOrNotFound, func() (*http.Request, error) {
+		return http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	})
 	if err != nil {
 		return fmt.Errorf("deezer: fetch %s: %w", reqURL, err)
 	}

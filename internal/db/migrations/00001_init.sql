@@ -1,5 +1,7 @@
 -- +goose Up
 
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
 CREATE TYPE entity_type AS ENUM ('artist', 'album', 'song');
 CREATE TYPE correlation_method AS ENUM ('source_id', 'fuzzy_name', 'manual');
 CREATE TYPE import_status AS ENUM ('queued', 'running', 'paused', 'completed', 'failed', 'cancelled');
@@ -58,6 +60,7 @@ CREATE TABLE artists (
     id              BIGSERIAL PRIMARY KEY,
     name            TEXT NOT NULL,
     name_normalized TEXT NOT NULL,
+    name_romanized  TEXT NOT NULL DEFAULT '',
     description     TEXT,
     image_id        UUID,
     pinned          BOOLEAN NOT NULL DEFAULT FALSE,
@@ -66,12 +69,15 @@ CREATE TABLE artists (
 );
 
 CREATE INDEX artists_name_normalized_idx ON artists (name_normalized);
+CREATE INDEX artists_name_normalized_trgm_idx ON artists USING GIN (name_normalized gin_trgm_ops);
+CREATE INDEX artists_name_romanized_trgm_idx ON artists USING GIN (name_romanized gin_trgm_ops);
 CREATE INDEX artists_updated_at_idx ON artists (updated_at);
 
 CREATE TABLE albums (
     id              BIGSERIAL PRIMARY KEY,
     name            TEXT NOT NULL,
     name_normalized TEXT NOT NULL,
+    name_romanized  TEXT NOT NULL DEFAULT '',
     release_date    DATE,
     description     TEXT,
     image_id        UUID,
@@ -81,12 +87,15 @@ CREATE TABLE albums (
 );
 
 CREATE INDEX albums_name_normalized_idx ON albums (name_normalized);
+CREATE INDEX albums_name_normalized_trgm_idx ON albums USING GIN (name_normalized gin_trgm_ops);
+CREATE INDEX albums_name_romanized_trgm_idx ON albums USING GIN (name_romanized gin_trgm_ops);
 CREATE INDEX albums_updated_at_idx ON albums (updated_at);
 
 CREATE TABLE songs (
     id              BIGSERIAL PRIMARY KEY,
     name            TEXT NOT NULL,
     name_normalized TEXT NOT NULL,
+    name_romanized  TEXT NOT NULL DEFAULT '',
     duration_ms     INTEGER,
     image_id        UUID,
     pinned          BOOLEAN NOT NULL DEFAULT FALSE,
@@ -95,6 +104,8 @@ CREATE TABLE songs (
 );
 
 CREATE INDEX songs_name_normalized_idx ON songs (name_normalized);
+CREATE INDEX songs_name_normalized_trgm_idx ON songs USING GIN (name_normalized gin_trgm_ops);
+CREATE INDEX songs_name_romanized_trgm_idx ON songs USING GIN (name_romanized gin_trgm_ops);
 CREATE INDEX songs_updated_at_idx ON songs (updated_at);
 
 CREATE TABLE album_artists (
@@ -136,7 +147,7 @@ CREATE TABLE sources (
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE UNIQUE INDEX sources_source_type_extracted_id_idx ON sources (source_type, extracted_id) WHERE extracted_id IS NOT NULL;
+CREATE UNIQUE INDEX sources_entity_type_source_type_extracted_id_idx ON sources (entity_type, source_type, extracted_id) WHERE extracted_id IS NOT NULL;
 CREATE INDEX sources_entity_idx ON sources (entity_type, entity_id);
 
 CREATE TABLE entity_aliases (
@@ -150,6 +161,19 @@ CREATE TABLE entity_aliases (
 
 CREATE INDEX entity_aliases_entity_idx ON entity_aliases (entity_type, entity_id);
 
+CREATE TABLE merge_suggestions (
+    id           BIGSERIAL PRIMARY KEY,
+    entity_type  entity_type NOT NULL,
+    lo_id        BIGINT NOT NULL,
+    hi_id        BIGINT NOT NULL,
+    score        REAL NOT NULL,
+    rejected     BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (lo_id < hi_id)
+);
+
+CREATE UNIQUE INDEX merge_suggestions_pair_idx ON merge_suggestions (entity_type, lo_id, hi_id);
+
 CREATE TABLE listens (
     id                   BIGSERIAL PRIMARY KEY,
     user_id              BIGINT NOT NULL REFERENCES users (id) ON DELETE CASCADE,
@@ -158,7 +182,8 @@ CREATE TABLE listens (
     client               TEXT,
     duration_played_ms   INTEGER,
     extra                JSONB NOT NULL DEFAULT '{}',
-    created_at           TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (user_id, song_id, listened_at)
 );
 
 CREATE INDEX listens_user_id_listened_at_idx ON listens (user_id, listened_at DESC);
@@ -226,7 +251,7 @@ CREATE TABLE daily_song_listens (
     song_id      BIGINT NOT NULL REFERENCES songs (id) ON DELETE CASCADE,
     day          DATE NOT NULL,
     listen_count INTEGER NOT NULL DEFAULT 0,
-    minutes_ms   BIGINT NOT NULL DEFAULT 0,
+    played_ms   BIGINT NOT NULL DEFAULT 0,
     PRIMARY KEY (user_id, song_id, day)
 );
 
@@ -265,14 +290,23 @@ CREATE TABLE entity_global_stats (
     entity_id         BIGINT NOT NULL,
     plays             INTEGER NOT NULL DEFAULT 0,
     unique_listeners  INTEGER NOT NULL DEFAULT 0,
+    played_ms        BIGINT NOT NULL DEFAULT 0,
     first_listened_at TIMESTAMPTZ,
     PRIMARY KEY (entity_type, entity_id)
 );
+
+CREATE TABLE server_state (
+    id             BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (id),
+    clean_shutdown BOOLEAN NOT NULL DEFAULT TRUE
+);
+
+INSERT INTO server_state (id, clean_shutdown) VALUES (TRUE, TRUE);
 
 -- +goose Down
 
 DROP TABLE entity_global_stats;
 DROP TABLE user_entity_first_listen;
+DROP TABLE server_state;
 DROP TABLE user_listen_state;
 DROP TABLE clock_cells;
 DROP TABLE daily_song_listens;
@@ -282,6 +316,7 @@ DROP TABLE import_jobs;
 DROP TABLE artist_blacklist;
 DROP TABLE now_playing;
 DROP TABLE listens;
+DROP TABLE merge_suggestions;
 DROP TABLE entity_aliases;
 DROP TABLE sources;
 DROP TABLE song_albums;
@@ -298,3 +333,4 @@ DROP TABLE users;
 DROP TYPE import_status;
 DROP TYPE correlation_method;
 DROP TYPE entity_type;
+DROP EXTENSION pg_trgm;

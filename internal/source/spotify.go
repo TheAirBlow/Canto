@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"Canto/internal/httpx"
 )
 
 // spotifyIDPattern matches a Spotify base62 entity id.
@@ -48,6 +50,7 @@ var (
 // spotifyProcessor resolves track/album/artist metadata via Spotify's anonymous pathfinder GraphQL API.
 type spotifyProcessor struct {
 	httpClient *http.Client
+	lockout    httpx.Lockout
 
 	mu             sync.Mutex
 	token          string
@@ -56,7 +59,7 @@ type spotifyProcessor struct {
 
 // NewSpotifyProcessor builds the processor.
 func NewSpotifyProcessor() Processor {
-	return &spotifyProcessor{httpClient: &http.Client{Timeout: 10 * time.Second}}
+	return &spotifyProcessor{httpClient: httpx.NewExternalClient(10 * time.Second)}
 }
 
 // ID identifies this processor in configured processor-order lists.
@@ -124,15 +127,16 @@ func (p *spotifyProcessor) anonymousToken(ctx context.Context) (string, error) {
 // refreshToken bootstraps a fresh anonymous token off the bootstrap track's embed page and caches it.
 func (p *spotifyProcessor) refreshToken(ctx context.Context) (string, error) {
 	reqURL := "https://open.spotify.com/embed/track/" + spotifyTokenBootstrapID
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64; rv:133.0) Gecko/20100101 Firefox/133.0")
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "en")
-
-	resp, err := p.httpClient.Do(req)
+	resp, err := httpx.DoLocked(ctx, p.httpClient, &p.lockout, httpx.OKOrNotFound, func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64; rv:133.0) Gecko/20100101 Firefox/133.0")
+		req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+		req.Header.Set("Accept-Language", "en")
+		return req, nil
+	})
 	if err != nil {
 		return "", fmt.Errorf("spotify: bootstrap anonymous token: %w", err)
 	}
@@ -216,14 +220,19 @@ func (p *spotifyProcessor) doPathfinderQuery(ctx context.Context, op spotifyOper
 	q.Set("extensions", string(extensionsJSON))
 	reqURL := spotifyPathfinderURL + "?" + q.Encode()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
-	if err != nil {
-		return nil, 0, err
+	// 401 passes straight through for pathfinderQuery's own refresh-and-retry-once dance to handle.
+	final := func(status int) bool {
+		return status == http.StatusOK || status == http.StatusUnauthorized || status == http.StatusNotFound
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("app-platform", "WebPlayer")
-
-	resp, err := p.httpClient.Do(req)
+	resp, err := httpx.DoLocked(ctx, p.httpClient, &p.lockout, final, func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("app-platform", "WebPlayer")
+		return req, nil
+	})
 	if err != nil {
 		return nil, 0, fmt.Errorf("spotify: %s: %w", op.name, err)
 	}

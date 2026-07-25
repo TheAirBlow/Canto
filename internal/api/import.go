@@ -75,6 +75,10 @@ func (s *Server) createImportBatch(w http.ResponseWriter, r *http.Request) {
 		badRequest(w, "service is required")
 		return
 	}
+	if service == string(importer.ImportServiceIngestBatch) {
+		badRequest(w, "service is internal-only, not a user-uploadable format")
+		return
+	}
 	fileHeaders := r.MultipartForm.File["files[]"]
 	if len(fileHeaders) == 0 {
 		badRequest(w, "at least one files[] part is required")

@@ -197,6 +197,7 @@ type Album struct {
 	ID             int64              `json:"id"`
 	Name           string             `json:"name"`
 	NameNormalized string             `json:"name_normalized"`
+	NameRomanized  string             `json:"name_romanized"`
 	ReleaseDate    pgtype.Date        `json:"release_date"`
 	Description    *string            `json:"description"`
 	ImageID        pgtype.UUID        `json:"image_id"`
@@ -224,6 +225,7 @@ type Artist struct {
 	ID             int64              `json:"id"`
 	Name           string             `json:"name"`
 	NameNormalized string             `json:"name_normalized"`
+	NameRomanized  string             `json:"name_romanized"`
 	Description    *string            `json:"description"`
 	ImageID        pgtype.UUID        `json:"image_id"`
 	Pinned         bool               `json:"pinned"`
@@ -249,7 +251,7 @@ type DailySongListen struct {
 	SongID      int64       `json:"song_id"`
 	Day         pgtype.Date `json:"day"`
 	ListenCount int32       `json:"listen_count"`
-	MinutesMs   int64       `json:"minutes_ms"`
+	PlayedMs    int64       `json:"played_ms"`
 }
 
 type EntityAlias struct {
@@ -265,6 +267,7 @@ type EntityGlobalStat struct {
 	EntityID        int64              `json:"entity_id"`
 	Plays           int32              `json:"plays"`
 	UniqueListeners int32              `json:"unique_listeners"`
+	PlayedMs        int64              `json:"played_ms"`
 	FirstListenedAt pgtype.Timestamptz `json:"first_listened_at"`
 }
 
@@ -307,11 +310,26 @@ type Listen struct {
 	CreatedAt        pgtype.Timestamptz `json:"created_at"`
 }
 
+type MergeSuggestion struct {
+	ID         int64              `json:"id"`
+	EntityType EntityType         `json:"entity_type"`
+	LoID       int64              `json:"lo_id"`
+	HiID       int64              `json:"hi_id"`
+	Score      float32            `json:"score"`
+	Rejected   bool               `json:"rejected"`
+	CreatedAt  pgtype.Timestamptz `json:"created_at"`
+}
+
 type NowPlaying struct {
 	UserID     int64              `json:"user_id"`
 	SongID     int64              `json:"song_id"`
 	StartedAt  pgtype.Timestamptz `json:"started_at"`
 	DurationMs *int32             `json:"duration_ms"`
+}
+
+type ServerState struct {
+	ID            bool `json:"id"`
+	CleanShutdown bool `json:"clean_shutdown"`
 }
 
 type Session struct {
@@ -326,6 +344,7 @@ type Song struct {
 	ID             int64              `json:"id"`
 	Name           string             `json:"name"`
 	NameNormalized string             `json:"name_normalized"`
+	NameRomanized  string             `json:"name_romanized"`
 	DurationMs     *int32             `json:"duration_ms"`
 	ImageID        pgtype.UUID        `json:"image_id"`
 	Pinned         bool               `json:"pinned"`

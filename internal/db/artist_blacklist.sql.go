@@ -24,7 +24,7 @@ func (q *Queries) BlacklistArtist(ctx context.Context, arg BlacklistArtistParams
 }
 
 const listBlacklistedArtists = `-- name: ListBlacklistedArtists :many
-SELECT a.id, a.name, a.name_normalized, a.description, a.image_id, a.pinned, a.created_at, a.updated_at FROM artists a
+SELECT a.id, a.name, a.name_normalized, a.name_romanized, a.description, a.image_id, a.pinned, a.created_at, a.updated_at FROM artists a
 JOIN artist_blacklist b ON b.artist_id = a.id
 WHERE b.user_id = $1
 ORDER BY a.name
@@ -43,6 +43,7 @@ func (q *Queries) ListBlacklistedArtists(ctx context.Context, userID int64) ([]A
 			&i.ID,
 			&i.Name,
 			&i.NameNormalized,
+			&i.NameRomanized,
 			&i.Description,
 			&i.ImageID,
 			&i.Pinned,

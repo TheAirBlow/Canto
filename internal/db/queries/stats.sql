@@ -18,6 +18,15 @@ RETURNING *;
 -- name: ListStatsCache :many
 SELECT * FROM stats_cache ORDER BY id;
 
+-- name: DeleteStatsCache :exec
+TRUNCATE stats_cache;
+
+-- name: DeleteStatsCacheForUser :exec
+DELETE FROM stats_cache WHERE user_id = sqlc.arg(user_id)::bigint OR user_id IS NULL;
+
+-- name: PruneStaleStatsCache :execrows
+DELETE FROM stats_cache WHERE computed_at < sqlc.arg(before)::timestamptz;
+
 -- name: SourcesBreakdown :many
 -- Stays a live query (not rolled up): source_type can change on re-correlation, so a
 -- rollup snapshot would go stale independent of new listens.
@@ -30,11 +39,6 @@ WITH user_listens AS (
       AND (s.duration_ms IS NULL OR s.duration_ms <= 0
            OR coalesce(l.duration_played_ms, s.duration_ms, 0) * 2 >= s.duration_ms
            OR coalesce(l.duration_played_ms, s.duration_ms, 0) >= 240000)
-      AND NOT EXISTS (
-        SELECT 1 FROM artist_blacklist bl
-        JOIN song_artists sa ON sa.artist_id = bl.artist_id
-        WHERE bl.user_id = l.user_id AND sa.song_id = l.song_id
-      )
 ),
 primary_source AS (
     SELECT song_id, source_type FROM (
@@ -58,13 +62,26 @@ WHERE (sqlc.narg(user_id)::bigint IS NULL OR l.user_id = sqlc.narg(user_id)::big
   AND (s.duration_ms IS NULL OR s.duration_ms <= 0
        OR coalesce(l.duration_played_ms, s.duration_ms, 0) * 2 >= s.duration_ms
        OR coalesce(l.duration_played_ms, s.duration_ms, 0) >= 240000)
-  AND NOT EXISTS (
-    SELECT 1 FROM artist_blacklist bl JOIN song_artists sa ON sa.artist_id = bl.artist_id
-    WHERE bl.user_id = l.user_id AND sa.song_id = l.song_id
-  )
   AND (sqlc.narg(artist_id)::bigint IS NULL OR EXISTS (
         SELECT 1 FROM song_artists sar WHERE sar.song_id = l.song_id AND sar.artist_id = sqlc.narg(artist_id)::bigint))
   AND (sqlc.narg(album_id)::bigint IS NULL OR EXISTS (
         SELECT 1 FROM song_albums sa2 WHERE sa2.song_id = l.song_id AND sa2.album_id = sqlc.narg(album_id)::bigint))
   AND (sqlc.narg(song_id)::bigint IS NULL OR l.song_id = sqlc.narg(song_id)::bigint)
 ORDER BY l.listened_at;
+
+-- name: EntityUserSummary :one
+-- Stays a live query: one user's listens of one entity, small and bounded (see InterestHistory).
+SELECT count(*)::bigint AS plays,
+       (coalesce(sum(coalesce(l.duration_played_ms, s.duration_ms, 0)), 0)::float8 / 60000.0)::float8 AS minutes_listened,
+       min(l.listened_at)::timestamptz AS first_listened_at
+FROM listens l
+JOIN songs s ON s.id = l.song_id
+WHERE l.user_id = sqlc.arg(user_id)::bigint
+  AND (s.duration_ms IS NULL OR s.duration_ms <= 0
+       OR coalesce(l.duration_played_ms, s.duration_ms, 0) * 2 >= s.duration_ms
+       OR coalesce(l.duration_played_ms, s.duration_ms, 0) >= 240000)
+  AND (sqlc.narg(artist_id)::bigint IS NULL OR EXISTS (
+        SELECT 1 FROM song_artists sar WHERE sar.song_id = l.song_id AND sar.artist_id = sqlc.narg(artist_id)::bigint))
+  AND (sqlc.narg(album_id)::bigint IS NULL OR EXISTS (
+        SELECT 1 FROM song_albums sa2 WHERE sa2.song_id = l.song_id AND sa2.album_id = sqlc.narg(album_id)::bigint))
+  AND (sqlc.narg(song_id)::bigint IS NULL OR l.song_id = sqlc.narg(song_id)::bigint);

@@ -150,9 +150,13 @@ func (s *Server) searchResults(ctx context.Context, entityType string, hits []se
 		if err != nil {
 			return nil, err
 		}
+		info, err := s.songPrimaryInfoMap(ctx, ids)
+		if err != nil {
+			return nil, err
+		}
 		out := make([]searchResultResponse, len(rows))
 		for i, row := range rows {
-			resp := newSongResponse(row)
+			resp := withPrimaryInfo(newSongResponse(row), info)
 			out[i] = searchResultResponse{Type: "song", Song: &resp}
 		}
 		return out, nil

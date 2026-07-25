@@ -1,17 +1,36 @@
 package api
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"slices"
 	"time"
 
 	"Canto/internal/auth"
+	"Canto/internal/importer"
 	"Canto/internal/ingest"
 )
 
 // listenBrainzIngesterID identifies the ListenBrainz-compatible ingester in enabled/forward settings.
 const listenBrainzIngesterID = "listenbrainz"
+
+// minValidListenedAt rejects a listen dated before scrobbling meaningfully existed.
+var minValidListenedAt = time.Date(2002, 1, 1, 0, 0, 0, 0, time.UTC)
+
+// maxFutureSkew tolerates modest client clock drift on a submitted listened_at.
+const maxFutureSkew = 5 * time.Minute
+
+// massSubmitThreshold is the payload size past which a submit-listens request is routed through a bulk-import job instead of processed inline.
+const massSubmitThreshold = 100
+
+// knownIngesters lists every ingest endpoint Canto exposes, for GET /settings/registry.
+var knownIngesters = []registryIngester{
+	{ID: listenBrainzIngesterID, Label: "ListenBrainz-compatible", APIPath: "/listenbrainz"},
+}
 
 // registerListenBrainz registers the ListenBrainz-compatible submit-listens endpoint.
 func (s *Server) registerListenBrainz(mux authMux) {
@@ -79,53 +98,94 @@ func (s *Server) submitListens(w http.ResponseWriter, r *http.Request) {
 		LinkOrder:     settings.LinkProcessors,
 		FallbackOrder: settings.FallbackProcessors,
 		MatcherOrder:  settings.FuzzyMatchers,
-		Normalize:     settings.FuzzyNormalize,
 	}
 	nowPlaying := req.ListenType == "playing_now"
 
+	entries := make([]ingest.ListenInput, 0, len(req.Payload))
+	items := make([]lbListen, 0, len(req.Payload)) // kept parallel to entries, for post-submit forwarding
 	for _, item := range req.Payload {
-		info := item.TrackMetadata.AdditionalInfo
-		var durationPlayedMs int32
-		if info.DurationPlayed != nil {
-			durationPlayedMs = *info.DurationPlayed
+		in, ok := buildListenInput(user.ID, item)
+		if !ok {
+			slog.Warn("submit listen: rejected implausible listened_at", "user", user.ID, "listened_at", item.ListenedAt)
+			continue
 		}
+		entries = append(entries, in)
+		items = append(items, item)
+	}
 
-		var durationMs int32
-		switch {
-		case info.DurationMs != nil:
-			durationMs = *info.DurationMs
-		case info.Duration != nil:
-			durationMs = *info.Duration * 1000
+	if !nowPlaying && len(entries) > massSubmitThreshold {
+		if err := s.routeToImportBatch(r.Context(), user.ID, entries); err != nil {
+			internalError(w, err.Error())
+			return
 		}
+		ok(w, map[string]string{"status": "ok"})
+		return
+	}
 
-		if info.OriginURL == "" {
-			info.OriginURL = ingest.InferOriginURL(info.RecordingMBID, info.SpotifyID)
-		}
-
-		in := ingest.ListenInput{
-			UserID:                   user.ID,
-			OriginURL:                info.OriginURL,
-			ArtistNames:              []string{item.TrackMetadata.ArtistName},
-			SongName:                 item.TrackMetadata.TrackName,
-			AlbumName:                item.TrackMetadata.ReleaseName,
-			ListenedAt:               time.Unix(item.ListenedAt, 0).UTC(),
-			DurationMs:               durationMs,
-			DurationPlayedMs:         durationPlayedMs,
-			SubmissionClient:         info.SubmissionClient,
-			SubmissionClientVersion:  info.SubmissionClientVersion,
-			OriginalSubmissionClient: info.OriginalSubmissionClient,
-			MediaPlayer:              info.MediaPlayer,
-			MediaPlayerVersion:       info.MediaPlayerVersion,
-			MusicService:             info.MusicService,
-			MusicServiceName:         info.MusicServiceName,
-		}
-		if _, err := s.ingest.SubmitListen(r.Context(), in, procSettings, nowPlaying); err != nil {
+	for i, in := range entries {
+		if _, err := s.ingest.SubmitListen(r.Context(), in, procSettings, nowPlaying, false); err != nil {
 			slog.Error("submit listen failed", "user", user.ID, "err", err)
 			internalError(w, err.Error())
 			return
 		}
-		s.dispatchForwards(settings.Forwards, listenBrainzIngesterID, req.ListenType, item)
+		s.dispatchForwards(settings.Forwards, listenBrainzIngesterID, req.ListenType, items[i])
 	}
 
 	ok(w, map[string]string{"status": "ok"})
+}
+
+// buildListenInput converts one ListenBrainz payload entry into a ListenInput, reporting false if listened_at is implausible.
+func buildListenInput(userID int64, item lbListen) (ingest.ListenInput, bool) {
+	listenedAt := time.Unix(item.ListenedAt, 0).UTC()
+	if listenedAt.Before(minValidListenedAt) || listenedAt.After(time.Now().Add(maxFutureSkew)) {
+		return ingest.ListenInput{}, false
+	}
+
+	info := item.TrackMetadata.AdditionalInfo
+	var durationPlayedMs int32
+	if info.DurationPlayed != nil {
+		durationPlayedMs = *info.DurationPlayed
+	}
+
+	var durationMs int32
+	switch {
+	case info.DurationMs != nil:
+		durationMs = *info.DurationMs
+	case info.Duration != nil:
+		durationMs = *info.Duration * 1000
+	}
+
+	if info.OriginURL == "" {
+		info.OriginURL = ingest.InferOriginURL(info.RecordingMBID, info.SpotifyID)
+	}
+
+	return ingest.ListenInput{
+		UserID:                   userID,
+		OriginURL:                info.OriginURL,
+		ArtistNames:              []string{item.TrackMetadata.ArtistName},
+		SongName:                 item.TrackMetadata.TrackName,
+		AlbumName:                item.TrackMetadata.ReleaseName,
+		ListenedAt:               listenedAt,
+		DurationMs:               durationMs,
+		DurationPlayedMs:         durationPlayedMs,
+		SubmissionClient:         info.SubmissionClient,
+		SubmissionClientVersion:  info.SubmissionClientVersion,
+		OriginalSubmissionClient: info.OriginalSubmissionClient,
+		MediaPlayer:              info.MediaPlayer,
+		MediaPlayerVersion:       info.MediaPlayerVersion,
+		MusicService:             info.MusicService,
+		MusicServiceName:         info.MusicServiceName,
+	}, true
+}
+
+// routeToImportBatch hands entries to the importer as a single job instead of processing them inline.
+func (s *Server) routeToImportBatch(ctx context.Context, userID int64, entries []ingest.ListenInput) error {
+	data, err := json.Marshal(entries)
+	if err != nil {
+		return fmt.Errorf("marshal submission batch: %w", err)
+	}
+	_, err = s.importer.CreateBatch(ctx, userID, importer.ImportServiceIngestBatch, []importer.UploadedFile{
+		{Filename: "submission.json", Reader: bytes.NewReader(data)},
+	})
+	return err
 }

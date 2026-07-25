@@ -16,6 +16,14 @@ type Timeframe struct {
 	TZ     string `json:"tz,omitempty"`
 }
 
+// TZOrUTC returns tf.TZ, defaulting to "UTC" when unset.
+func (tf Timeframe) TZOrUTC() string {
+	if tf.TZ == "" {
+		return "UTC"
+	}
+	return tf.TZ
+}
+
 // Resolve turns tf into concrete [from, to) bounds relative to now, in tf's timezone (UTC if unset).
 func (tf Timeframe) Resolve(now time.Time) (from, to time.Time, err error) {
 	loc := time.UTC

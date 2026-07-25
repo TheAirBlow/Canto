@@ -30,17 +30,16 @@ type Config struct {
 
 // Worker periodically re-fetches metadata for artists/albums/songs whose data has gone stale.
 type Worker struct {
-	cfg       Config
-	queries   *db.Queries
-	engine    *correlate.Engine
-	lookup    *enrich.Lookup
-	matchers  []correlate.FuzzyMatcher
-	normalize bool
+	cfg      Config
+	queries  *db.Queries
+	engine   *correlate.Engine
+	lookup   *enrich.Lookup
+	matchers []correlate.FuzzyMatcher
 }
 
-// NewWorker builds a Worker. matchers/normalize seed any catalog backfill triggered by a refreshed album.
-func NewWorker(cfg Config, queries *db.Queries, registry *source.Registry, engine *correlate.Engine, matchers []correlate.FuzzyMatcher, normalize bool) *Worker {
-	return &Worker{cfg: cfg, queries: queries, engine: engine, lookup: enrich.NewLookup(queries, registry), matchers: matchers, normalize: normalize}
+// NewWorker builds a Worker. matchers seed any catalog backfill triggered by a refreshed album.
+func NewWorker(cfg Config, queries *db.Queries, registry *source.Registry, engine *correlate.Engine, matchers []correlate.FuzzyMatcher) *Worker {
+	return &Worker{cfg: cfg, queries: queries, engine: engine, lookup: enrich.NewLookup(queries, registry), matchers: matchers}
 }
 
 // Enabled reports whether any entity type is configured for refresh.
@@ -110,7 +109,7 @@ func (w *Worker) refreshArtist(ctx context.Context, artist db.Artist) {
 		if fetched.Description != "" {
 			description = &fetched.Description
 		}
-		if newID := w.downloadThumbnail(fetched.ThumbnailURL); newID != nil {
+		if newID := w.downloadThumbnail(ctx, fetched.ThumbnailURL); newID != nil {
 			imageID = uuidParam(newID)
 		}
 	}
@@ -133,7 +132,7 @@ func (w *Worker) refreshAlbum(ctx context.Context, album db.Album) {
 		if fetched.Description != "" {
 			description = &fetched.Description
 		}
-		if newID := w.downloadThumbnail(fetched.ThumbnailURL); newID != nil {
+		if newID := w.downloadThumbnail(ctx, fetched.ThumbnailURL); newID != nil {
 			imageID = uuidParam(newID)
 		}
 	}
@@ -153,7 +152,7 @@ func (w *Worker) refreshSong(ctx context.Context, song db.Song) {
 	imageID := song.ImageID
 
 	if fetched, ok := w.lookup.Song(ctx, song.ID); ok {
-		if newID := w.downloadThumbnail(fetched.ThumbnailURL); newID != nil {
+		if newID := w.downloadThumbnail(ctx, fetched.ThumbnailURL); newID != nil {
 			imageID = uuidParam(newID)
 		}
 	}
@@ -171,9 +170,10 @@ func (w *Worker) refreshSong(ctx context.Context, song db.Song) {
 func (w *Worker) backfillTracks(ctx context.Context, processor source.Processor, albumID int64, tracks []source.AlbumTrack) {
 	sourceType := processor.Type()
 	for _, track := range tracks {
+		artistNames := source.Names(track.Artists)
 		artistIDs := make([]int64, 0, len(track.Artists))
 		for _, artistMeta := range track.Artists {
-			artistID, _, err := w.engine.ResolveArtist(ctx, artistMeta.Name, sourceType, artistMeta.ExtractedID, "", w.matchers, w.normalize)
+			artistID, _, err := w.engine.ResolveArtist(ctx, artistMeta.Name, sourceType, artistMeta.ExtractedID, "", w.matchers)
 			if err != nil {
 				slog.Warn("refresh: resolve track artist failed", "album", albumID, "err", err)
 				continue
@@ -186,13 +186,13 @@ func (w *Worker) backfillTracks(ctx context.Context, processor source.Processor,
 			durationMs = &track.DurationMs
 		}
 		trackNumber := track.TrackNumber
-		songID, created, err := w.engine.ResolveSong(ctx, track.Name, sourceType, track.ExtractedID, "", durationMs, artistIDs, &albumID, &trackNumber, w.matchers, w.normalize)
+		songID, created, err := w.engine.ResolveSong(ctx, track.Name, sourceType, track.ExtractedID, "", durationMs, artistIDs, artistNames, &albumID, &trackNumber, w.matchers)
 		if err != nil {
 			slog.Warn("refresh: resolve track failed", "album", albumID, "track", track.Name, "err", err)
 			continue
 		}
 		if created && track.ThumbnailURL != "" {
-			if imageID := w.downloadThumbnail(track.ThumbnailURL); imageID != nil {
+			if imageID := w.downloadThumbnail(ctx, track.ThumbnailURL); imageID != nil {
 				if err := w.queries.UpdateSongThumbnail(ctx, db.UpdateSongThumbnailParams{ID: songID, ImageID: uuidParam(imageID)}); err != nil {
 					slog.Warn("refresh: update track thumbnail failed", "song", songID, "err", err)
 				}
@@ -202,12 +202,12 @@ func (w *Worker) backfillTracks(ctx context.Context, processor source.Processor,
 }
 
 // downloadThumbnail downloads url into a freshly minted image cache entry, returning its id, or nil on an empty url or failure.
-func (w *Worker) downloadThumbnail(url string) *uuid.UUID {
+func (w *Worker) downloadThumbnail(ctx context.Context, url string) *uuid.UUID {
 	if url == "" {
 		return nil
 	}
 	id := uuid.New()
-	if err := images.Download(id, url); err != nil {
+	if err := images.Download(ctx, id, url); err != nil {
 		slog.Warn("thumbnail download failed", "url", url, "err", err)
 		return nil
 	}

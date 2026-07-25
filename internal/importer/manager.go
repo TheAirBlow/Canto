@@ -12,15 +12,20 @@ import (
 	"Canto/internal/config"
 	"Canto/internal/db"
 	"Canto/internal/ingest"
+	"Canto/internal/search"
+	"Canto/internal/stats"
 )
 
 // Manager owns the shared import worker pool and per-format parsers.
 type Manager struct {
 	ctx      context.Context // canceled on graceful shutdown; every running job watches it to pause cleanly
 	wg       sync.WaitGroup  // tracks in-flight runJob calls, so shutdown can wait for them to pause/finish
+	runMu    sync.Mutex      // held for a job's entire run, so only one bulk import job runs at a time
 	dbPool   *pgxpool.Pool
 	queries  *db.Queries
 	ingest   *ingest.Service
+	search   *search.Client
+	stats    *stats.Engine
 	defaults config.ProcessorsConfig
 	sem      chan struct{}
 	dataDir  string
@@ -28,9 +33,9 @@ type Manager struct {
 }
 
 // NewManager builds a Manager backed by queries/ingestService, with a shared pool sized workers; canceling ctx signals every running job to pause rather than abort mid-write.
-func NewManager(ctx context.Context, dbPool *pgxpool.Pool, queries *db.Queries, ingestService *ingest.Service, defaults config.ProcessorsConfig, workers int, dataDir string) *Manager {
+func NewManager(ctx context.Context, dbPool *pgxpool.Pool, queries *db.Queries, ingestService *ingest.Service, searchClient *search.Client, statsEngine *stats.Engine, defaults config.ProcessorsConfig, workers int, dataDir string) *Manager {
 	return &Manager{
-		ctx: ctx, dbPool: dbPool, queries: queries, ingest: ingestService, defaults: defaults,
+		ctx: ctx, dbPool: dbPool, queries: queries, ingest: ingestService, search: searchClient, stats: statsEngine, defaults: defaults,
 		sem: make(chan struct{}, workers), dataDir: dataDir, formats: defaultFormats(),
 	}
 }

@@ -226,6 +226,32 @@ func (q *Queries) SetUserImage(ctx context.Context, arg SetUserImageParams) (Use
 	return i, err
 }
 
+const updateUserPassword = `-- name: UpdateUserPassword :one
+UPDATE users SET password_hash = $2 WHERE id = $1 RETURNING id, username, password_hash, display_name, description, image_id, public, is_admin, created_at
+`
+
+type UpdateUserPasswordParams struct {
+	ID           int64  `json:"id"`
+	PasswordHash string `json:"password_hash"`
+}
+
+func (q *Queries) UpdateUserPassword(ctx context.Context, arg UpdateUserPasswordParams) (User, error) {
+	row := q.db.QueryRow(ctx, updateUserPassword, arg.ID, arg.PasswordHash)
+	var i User
+	err := row.Scan(
+		&i.ID,
+		&i.Username,
+		&i.PasswordHash,
+		&i.DisplayName,
+		&i.Description,
+		&i.ImageID,
+		&i.Public,
+		&i.IsAdmin,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const updateUserProfile = `-- name: UpdateUserProfile :one
 UPDATE users SET display_name = $2, description = $3, public = $4 WHERE id = $1 RETURNING id, username, password_hash, display_name, description, image_id, public, is_admin, created_at
 `
@@ -244,6 +270,32 @@ func (q *Queries) UpdateUserProfile(ctx context.Context, arg UpdateUserProfilePa
 		arg.Description,
 		arg.Public,
 	)
+	var i User
+	err := row.Scan(
+		&i.ID,
+		&i.Username,
+		&i.PasswordHash,
+		&i.DisplayName,
+		&i.Description,
+		&i.ImageID,
+		&i.Public,
+		&i.IsAdmin,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const updateUserUsername = `-- name: UpdateUserUsername :one
+UPDATE users SET username = $2 WHERE id = $1 RETURNING id, username, password_hash, display_name, description, image_id, public, is_admin, created_at
+`
+
+type UpdateUserUsernameParams struct {
+	ID       int64  `json:"id"`
+	Username string `json:"username"`
+}
+
+func (q *Queries) UpdateUserUsername(ctx context.Context, arg UpdateUserUsernameParams) (User, error) {
+	row := q.db.QueryRow(ctx, updateUserUsername, arg.ID, arg.Username)
 	var i User
 	err := row.Scan(
 		&i.ID,

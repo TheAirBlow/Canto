@@ -1,0 +1,42 @@
+{
+  "name": "canto-frontend",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build": "nuxt build",
+    "dev": "nuxt dev",
+    "generate": "nuxt generate",
+    "preview": "nuxt preview",
+    "postinstall": "nuxt prepare",
+    "lint": "eslint ."
+  },
+  "dependencies": {
+    "@nuxt/icon": "2.3.1",
+    "@nuxtjs/color-mode": "4.0.1",
+    "@pinia/nuxt": "1.0.1",
+    "@vueuse/core": "14.3.0",
+    "@vueuse/nuxt": "14.3.0",
+    "nuxt": "4.5.0",
+    "nuxt-charts": "2.2.0",
+    "pinia": "4.0.2",
+    "pinia-plugin-persistedstate": "^4.7.1",
+    "vue": "3.5.40",
+    "vue-router": "^5.2.0"
+  },
+  "devDependencies": {
+    "@iconify-json/fa6-brands": "1.2.6",
+    "@iconify-json/fa6-regular": "1.2.4",
+    "@iconify-json/fa6-solid": "1.2.4",
+    "@nuxt/eslint": "1.16.0",
+    "@tailwindcss/vite": "4.3.3",
+    "daisyui": "5.7.0",
+    "tailwindcss": "4.3.3",
+    "typescript": "5.9.3",
+    "vue-tsc": "3.3.7"
+  },
+  "trustedDependencies": [
+    "esbuild",
+    "maplibre-gl",
+    "unrs-resolver"
+  ]
+}

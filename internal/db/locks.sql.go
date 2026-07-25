@@ -9,16 +9,16 @@ import (
 	"context"
 )
 
-const advisoryLockEntityName = `-- name: AdvisoryLockEntityName :exec
+const advisoryLockKey = `-- name: AdvisoryLockKey :exec
 SELECT pg_advisory_xact_lock(hashtextextended($1::text, $2::bigint))
 `
 
-type AdvisoryLockEntityNameParams struct {
-	NameNormalized string `json:"name_normalized"`
-	Seed           int64  `json:"seed"`
+type AdvisoryLockKeyParams struct {
+	Key  string `json:"key"`
+	Seed int64  `json:"seed"`
 }
 
-func (q *Queries) AdvisoryLockEntityName(ctx context.Context, arg AdvisoryLockEntityNameParams) error {
-	_, err := q.db.Exec(ctx, advisoryLockEntityName, arg.NameNormalized, arg.Seed)
+func (q *Queries) AdvisoryLockKey(ctx context.Context, arg AdvisoryLockKeyParams) error {
+	_, err := q.db.Exec(ctx, advisoryLockKey, arg.Key, arg.Seed)
 	return err
 }

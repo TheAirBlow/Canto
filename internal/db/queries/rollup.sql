@@ -1,23 +1,13 @@
--- name: CheckBlacklistedSongs :many
--- Returns every (user_id, song_id) pair, from the sets given, that is currently blacklisted.
--- The two arrays are checked as independent sets, not paired positionally, so callers must
--- re-check membership of their own (user_id, song_id) pairs against the result.
-SELECT DISTINCT bl.user_id, sa.song_id
-FROM artist_blacklist bl
-JOIN song_artists sa ON sa.artist_id = bl.artist_id
-WHERE bl.user_id = ANY(sqlc.arg(user_ids)::bigint[])
-  AND sa.song_id = ANY(sqlc.arg(song_ids)::bigint[]);
-
 -- name: UpsertDailySongListens :exec
-INSERT INTO daily_song_listens (user_id, song_id, day, listen_count, minutes_ms)
+INSERT INTO daily_song_listens (user_id, song_id, day, listen_count, played_ms)
 SELECT unnest(sqlc.arg(user_ids)::bigint[]),
        unnest(sqlc.arg(song_ids)::bigint[]),
        unnest(sqlc.arg(days)::date[]),
        unnest(sqlc.arg(listen_counts)::int[]),
-       unnest(sqlc.arg(minutes_ms)::bigint[])
+       unnest(sqlc.arg(played_ms)::bigint[])
 ON CONFLICT (user_id, song_id, day) DO UPDATE SET
     listen_count = daily_song_listens.listen_count + excluded.listen_count,
-    minutes_ms = daily_song_listens.minutes_ms + excluded.minutes_ms;
+    played_ms = daily_song_listens.played_ms + excluded.played_ms;
 
 -- name: UpsertClockCells :exec
 INSERT INTO clock_cells (user_id, day, hour, listen_count)
@@ -41,13 +31,15 @@ ON CONFLICT (user_id, entity_type, entity_id) DO NOTHING
 RETURNING user_id, entity_type, entity_id;
 
 -- name: UpsertEntityGlobalPlays :exec
-INSERT INTO entity_global_stats (entity_type, entity_id, plays, first_listened_at)
+INSERT INTO entity_global_stats (entity_type, entity_id, plays, played_ms, first_listened_at)
 SELECT unnest(sqlc.arg(entity_types)::text[])::entity_type,
        unnest(sqlc.arg(entity_ids)::bigint[]),
        unnest(sqlc.arg(plays)::int[]),
+       unnest(sqlc.arg(played_ms)::bigint[]),
        unnest(sqlc.arg(first_ats)::timestamptz[])
 ON CONFLICT (entity_type, entity_id) DO UPDATE SET
     plays = entity_global_stats.plays + excluded.plays,
+    played_ms = entity_global_stats.played_ms + excluded.played_ms,
     first_listened_at = LEAST(entity_global_stats.first_listened_at, excluded.first_listened_at);
 
 -- name: BumpEntityGlobalUniqueListeners :exec
@@ -110,7 +102,7 @@ SELECT
     (SELECT count(DISTINCT song_id) FROM scoped)::bigint AS unique_tracks,
     (SELECT count(DISTINCT sa.album_id) FROM scoped s JOIN song_albums sa ON sa.song_id = s.song_id)::bigint AS unique_albums,
     (SELECT count(DISTINCT sar.artist_id) FROM scoped s JOIN song_artists sar ON sar.song_id = s.song_id)::bigint AS unique_artists,
-    ((SELECT coalesce(sum(minutes_ms), 0) FROM scoped)::float8 / 60000.0)::float8 AS minutes_listened,
+    ((SELECT coalesce(sum(played_ms), 0) FROM scoped)::float8 / 60000.0)::float8 AS minutes_listened,
     (SELECT count(DISTINCT day) FROM scoped)::bigint AS days_active;
 
 -- name: RollupAvgSessionLengthMs :one
@@ -132,18 +124,27 @@ session_spans AS (SELECT session_id, min(listened_at) AS start_at, max(listened_
 SELECT coalesce(avg(extract(epoch FROM end_at) - extract(epoch FROM start_at)) * 1000, 0)::float8 AS avg_session_length_ms FROM session_spans;
 
 -- name: RollupTopArtists :many
+-- blacklisted is always false for the global scope (user_id NULL): blacklisting is a personal
+-- preference, not something one user's opinion should reorder for everyone else.
 WITH scoped AS (
     SELECT * FROM daily_song_listens dsl
     WHERE (sqlc.narg(user_id)::bigint IS NULL OR dsl.user_id = sqlc.narg(user_id)::bigint)
       AND dsl.day >= sqlc.arg(from_day)::date
       AND dsl.day < sqlc.arg(to_day)::date
 )
-SELECT sar.artist_id, a.name, sum(s.listen_count)::bigint AS listen_count
+SELECT sar.artist_id, a.name, a.image_id, sum(s.listen_count)::bigint AS listen_count,
+       (sum(s.played_ms)::float8 / 60000.0)::float8 AS minutes_listened,
+       EXISTS (
+         SELECT 1 FROM artist_blacklist bl
+         WHERE bl.user_id = sqlc.narg(user_id)::bigint AND bl.artist_id = sar.artist_id
+       ) AS blacklisted
 FROM scoped s
 JOIN song_artists sar ON sar.song_id = s.song_id
 JOIN artists a ON a.id = sar.artist_id
-GROUP BY sar.artist_id, a.name
-ORDER BY listen_count DESC, a.name
+GROUP BY sar.artist_id, a.name, a.image_id
+ORDER BY blacklisted ASC,
+    (CASE WHEN sqlc.arg(sort_by)::text = 'minutes' THEN sum(s.played_ms)::float8 ELSE sum(s.listen_count)::float8 END) DESC,
+    a.name
 LIMIT sqlc.arg(max_rows)::int OFFSET sqlc.arg(row_offset)::int;
 
 -- name: RollupTopAlbums :many
@@ -153,12 +154,23 @@ WITH scoped AS (
       AND dsl.day >= sqlc.arg(from_day)::date
       AND dsl.day < sqlc.arg(to_day)::date
 )
-SELECT sa.album_id, al.name, sum(s.listen_count)::bigint AS listen_count
+SELECT sa.album_id, al.name, al.image_id, sum(s.listen_count)::bigint AS listen_count,
+       (sum(s.played_ms)::float8 / 60000.0)::float8 AS minutes_listened,
+       coalesce((SELECT ar.id FROM album_artists aa2 JOIN artists ar ON ar.id = aa2.artist_id
+        WHERE aa2.album_id = sa.album_id ORDER BY aa2.position LIMIT 1), 0)::bigint AS artist_id,
+       coalesce((SELECT ar.name FROM album_artists aa2 JOIN artists ar ON ar.id = aa2.artist_id
+        WHERE aa2.album_id = sa.album_id ORDER BY aa2.position LIMIT 1), '')::text AS artist_name,
+       EXISTS (
+         SELECT 1 FROM album_artists aa3 JOIN artist_blacklist bl ON bl.artist_id = aa3.artist_id
+         WHERE aa3.album_id = sa.album_id AND bl.user_id = sqlc.narg(user_id)::bigint
+       ) AS blacklisted
 FROM scoped s
 JOIN song_albums sa ON sa.song_id = s.song_id
 JOIN albums al ON al.id = sa.album_id
-GROUP BY sa.album_id, al.name
-ORDER BY listen_count DESC, al.name
+GROUP BY sa.album_id, al.name, al.image_id
+ORDER BY blacklisted ASC,
+    (CASE WHEN sqlc.arg(sort_by)::text = 'minutes' THEN sum(s.played_ms)::float8 ELSE sum(s.listen_count)::float8 END) DESC,
+    al.name
 LIMIT sqlc.arg(max_rows)::int OFFSET sqlc.arg(row_offset)::int;
 
 -- name: RollupTopTracks :many
@@ -172,11 +184,26 @@ WITH scoped AS (
       AND (sqlc.narg(album_id)::bigint IS NULL OR EXISTS (
             SELECT 1 FROM song_albums sa2 WHERE sa2.song_id = dsl.song_id AND sa2.album_id = sqlc.narg(album_id)::bigint))
 )
-SELECT s.song_id, sg.name, sum(s.listen_count)::bigint AS listen_count
+SELECT s.song_id, sg.name, sg.image_id, sum(s.listen_count)::bigint AS listen_count,
+       (sum(s.played_ms)::float8 / 60000.0)::float8 AS minutes_listened,
+       coalesce((SELECT ar.id FROM song_artists sar2 JOIN artists ar ON ar.id = sar2.artist_id
+        WHERE sar2.song_id = s.song_id ORDER BY sar2.position LIMIT 1), 0)::bigint AS artist_id,
+       coalesce((SELECT ar.name FROM song_artists sar2 JOIN artists ar ON ar.id = sar2.artist_id
+        WHERE sar2.song_id = s.song_id ORDER BY sar2.position LIMIT 1), '')::text AS artist_name,
+       coalesce((SELECT al.id FROM song_albums sal JOIN albums al ON al.id = sal.album_id
+        WHERE sal.song_id = s.song_id ORDER BY sal.track_number LIMIT 1), 0)::bigint AS album_id,
+       coalesce((SELECT al.name FROM song_albums sal JOIN albums al ON al.id = sal.album_id
+        WHERE sal.song_id = s.song_id ORDER BY sal.track_number LIMIT 1), '')::text AS album_name,
+       EXISTS (
+         SELECT 1 FROM song_artists sar3 JOIN artist_blacklist bl ON bl.artist_id = sar3.artist_id
+         WHERE sar3.song_id = s.song_id AND bl.user_id = sqlc.narg(user_id)::bigint
+       ) AS blacklisted
 FROM scoped s
 JOIN songs sg ON sg.id = s.song_id
-GROUP BY s.song_id, sg.name
-ORDER BY listen_count DESC, sg.name
+GROUP BY s.song_id, sg.name, sg.image_id
+ORDER BY blacklisted ASC,
+    (CASE WHEN sqlc.arg(sort_by)::text = 'minutes' THEN sum(s.played_ms)::float8 ELSE sum(s.listen_count)::float8 END) DESC,
+    sg.name
 LIMIT sqlc.arg(max_rows)::int OFFSET sqlc.arg(row_offset)::int;
 
 -- name: RollupActivityBuckets :many
@@ -189,7 +216,8 @@ WITH scoped AS (
             SELECT 1 FROM song_albums sa2 WHERE sa2.song_id = dsl.song_id AND sa2.album_id = sqlc.narg(album_id)::bigint))
       AND (sqlc.narg(song_id)::bigint IS NULL OR dsl.song_id = sqlc.narg(song_id)::bigint)
 )
-SELECT gs.bucket, coalesce(sum(sc.listen_count), 0)::bigint AS listen_count
+SELECT gs.bucket, coalesce(sum(sc.listen_count), 0)::bigint AS listen_count,
+       (coalesce(sum(sc.played_ms), 0)::float8 / 60000.0)::float8 AS minutes_listened
 FROM generate_series(sqlc.arg(from_time)::timestamptz, sqlc.arg(to_time)::timestamptz, sqlc.arg(step)::interval) AS gs(bucket)
 LEFT JOIN scoped sc
   ON (sc.day::timestamp AT TIME ZONE 'UTC') >= gs.bucket AND (sc.day::timestamp AT TIME ZONE 'UTC') < gs.bucket + sqlc.arg(step)::interval
@@ -220,12 +248,19 @@ FROM totals t JOIN discoveries d ON d.bucket = t.bucket
 ORDER BY t.bucket;
 
 -- name: RollupClockGrid :many
-SELECT extract(dow FROM day)::smallint AS day_of_week, hour, sum(listen_count)::bigint AS listen_count
-FROM clock_cells
-WHERE (sqlc.narg(user_id)::bigint IS NULL OR user_id = sqlc.narg(user_id)::bigint)
-  AND day >= sqlc.arg(from_day)::date
-  AND day < sqlc.arg(to_day)::date
-GROUP BY extract(dow FROM day), hour;
+-- clock_cells stores day/hour in UTC; shift into tz here so hours reflect the caller's local time.
+SELECT extract(dow FROM local_ts)::smallint AS day_of_week,
+       extract(hour FROM local_ts)::smallint AS hour,
+       sum(listen_count)::bigint AS listen_count
+FROM (
+    SELECT (day::timestamp + hour * interval '1 hour') AT TIME ZONE 'UTC' AT TIME ZONE sqlc.arg(tz)::text AS local_ts,
+           listen_count
+    FROM clock_cells
+    WHERE (sqlc.narg(user_id)::bigint IS NULL OR user_id = sqlc.narg(user_id)::bigint)
+      AND day >= sqlc.arg(from_day)::date
+      AND day < sqlc.arg(to_day)::date
+) shifted
+GROUP BY 1, 2;
 
 -- name: RollupTopDay :one
 SELECT day, sum(listen_count)::bigint AS listen_count
@@ -248,7 +283,7 @@ WHERE user_id = sqlc.arg(user_id)::bigint
   AND first_at < sqlc.arg(to_time)::timestamptz;
 
 -- name: RollupEntitySummary :one
-SELECT plays, unique_listeners, first_listened_at
+SELECT plays, unique_listeners, (played_ms::float8 / 60000.0)::float8 AS minutes_listened, first_listened_at
 FROM entity_global_stats
 WHERE entity_type = sqlc.arg(entity_type)::entity_type AND entity_id = sqlc.arg(entity_id)::bigint;
 
@@ -265,12 +300,8 @@ WITH eligible_listens AS (
     WHERE (s.duration_ms IS NULL OR s.duration_ms <= 0
            OR coalesce(l.duration_played_ms, s.duration_ms, 0) * 2 >= s.duration_ms
            OR coalesce(l.duration_played_ms, s.duration_ms, 0) >= 240000)
-      AND NOT EXISTS (
-        SELECT 1 FROM artist_blacklist bl JOIN song_artists sa ON sa.artist_id = bl.artist_id
-        WHERE bl.user_id = l.user_id AND sa.song_id = l.song_id
-      )
 )
-INSERT INTO daily_song_listens (user_id, song_id, day, listen_count, minutes_ms)
+INSERT INTO daily_song_listens (user_id, song_id, day, listen_count, played_ms)
 SELECT user_id, song_id, (listened_at AT TIME ZONE 'UTC')::date, count(*)::int, coalesce(sum(played_ms), 0)::bigint
 FROM eligible_listens
 GROUP BY user_id, song_id, (listened_at AT TIME ZONE 'UTC')::date;
@@ -284,10 +315,6 @@ WITH eligible_listens AS (
     WHERE (s.duration_ms IS NULL OR s.duration_ms <= 0
            OR coalesce(l.duration_played_ms, s.duration_ms, 0) * 2 >= s.duration_ms
            OR coalesce(l.duration_played_ms, s.duration_ms, 0) >= 240000)
-      AND NOT EXISTS (
-        SELECT 1 FROM artist_blacklist bl JOIN song_artists sa ON sa.artist_id = bl.artist_id
-        WHERE bl.user_id = l.user_id AND sa.song_id = l.song_id
-      )
 )
 INSERT INTO clock_cells (user_id, day, hour, listen_count)
 SELECT user_id, (listened_at AT TIME ZONE 'UTC')::date, extract(hour FROM listened_at AT TIME ZONE 'UTC')::smallint, count(*)::int
@@ -303,10 +330,6 @@ WITH eligible_listens AS (
     WHERE (s.duration_ms IS NULL OR s.duration_ms <= 0
            OR coalesce(l.duration_played_ms, s.duration_ms, 0) * 2 >= s.duration_ms
            OR coalesce(l.duration_played_ms, s.duration_ms, 0) >= 240000)
-      AND NOT EXISTS (
-        SELECT 1 FROM artist_blacklist bl JOIN song_artists sa ON sa.artist_id = bl.artist_id
-        WHERE bl.user_id = l.user_id AND sa.song_id = l.song_id
-      )
 )
 INSERT INTO user_entity_first_listen (user_id, entity_type, entity_id, first_at)
 SELECT user_id, 'song'::entity_type, song_id, min(listened_at) FROM eligible_listens GROUP BY user_id, song_id
@@ -328,20 +351,17 @@ WITH eligible_listens AS (
     WHERE (s.duration_ms IS NULL OR s.duration_ms <= 0
            OR coalesce(l.duration_played_ms, s.duration_ms, 0) * 2 >= s.duration_ms
            OR coalesce(l.duration_played_ms, s.duration_ms, 0) >= 240000)
-      AND NOT EXISTS (
-        SELECT 1 FROM artist_blacklist bl JOIN song_artists sa ON sa.artist_id = bl.artist_id
-        WHERE bl.user_id = l.user_id AND sa.song_id = l.song_id
-      )
 )
-INSERT INTO entity_global_stats (entity_type, entity_id, plays, unique_listeners, first_listened_at)
-SELECT entity_type, entity_id, count(*)::int AS plays, count(DISTINCT user_id)::int AS unique_listeners, min(first_at)
+INSERT INTO entity_global_stats (entity_type, entity_id, plays, unique_listeners, played_ms, first_listened_at)
+SELECT entity_type, entity_id, count(*)::int AS plays, count(DISTINCT user_id)::int AS unique_listeners,
+       coalesce(sum(played_ms), 0)::bigint AS played_ms, min(first_at)
 FROM (
-    SELECT user_id, 'song'::entity_type AS entity_type, song_id AS entity_id, listened_at AS first_at FROM eligible_listens
+    SELECT user_id, 'song'::entity_type AS entity_type, song_id AS entity_id, listened_at AS first_at, played_ms FROM eligible_listens
     UNION ALL
-    SELECT el.user_id, 'album'::entity_type, sa.album_id, el.listened_at
+    SELECT el.user_id, 'album'::entity_type, sa.album_id, el.listened_at, el.played_ms
     FROM eligible_listens el JOIN song_albums sa ON sa.song_id = el.song_id
     UNION ALL
-    SELECT el.user_id, 'artist'::entity_type, sar.artist_id, el.listened_at
+    SELECT el.user_id, 'artist'::entity_type, sar.artist_id, el.listened_at, el.played_ms
     FROM eligible_listens el JOIN song_artists sar ON sar.song_id = el.song_id
 ) t
 GROUP BY entity_type, entity_id;

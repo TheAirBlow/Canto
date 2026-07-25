@@ -29,11 +29,12 @@ func (s *Server) registerUsers(mux authMux) {
 	mux.HandleFunc("POST /user/register", s.register)
 	mux.HandleFunc("POST /user/login", s.login)
 	mux.CookieAuthHandleFunc("POST /user/logout", s.logout)
-	mux.CookieAuthHandleFunc("GET /user", s.listUsers)
-	mux.CookieAuthHandleFunc("GET /user/{id}", s.getUser)
+	mux.OptionalAuthHandleFunc("GET /user", s.listUsers)
+	mux.OptionalAuthHandleFunc("GET /user/{id}", s.getUser)
 	mux.CookieAuthHandleFunc("GET /user/me", s.me)
 	mux.CookieAuthHandleFunc("PUT /user/me", s.updateProfile)
 	mux.CookieAuthHandleFunc("PUT /user/me/image", s.uploadProfileImage)
+	mux.CookieAuthHandleFunc("PUT /user/me/credentials", s.updateCredentials)
 }
 
 // credentialsRequest is the JSON body for register and login.
@@ -327,6 +328,78 @@ func (s *Server) uploadProfileImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	images.DeleteIfSet(caller.ImageID)
+	s.syncUserSearchIndex(r.Context(), user)
+	ok(w, newUserResponse(user))
+}
+
+// updateCredentialsRequest is the JSON body for changing the caller's own username and/or password.
+type updateCredentialsRequest struct {
+	CurrentPassword string  `json:"current_password"`
+	NewUsername     *string `json:"new_username,omitempty"`
+	NewPassword     *string `json:"new_password,omitempty"`
+}
+
+// updateCredentials changes the caller's own username and/or password behind a current-password check, dropping every other session on a password change.
+func (s *Server) updateCredentials(w http.ResponseWriter, r *http.Request) {
+	caller, _ := auth.UserFromContext(r.Context())
+
+	var req updateCredentialsRequest
+	if err := decode(r, &req); err != nil {
+		badRequest(w, err.Error())
+		return
+	}
+	if req.NewUsername == nil && req.NewPassword == nil {
+		badRequest(w, "new_username or new_password is required")
+		return
+	}
+	if !auth.VerifyPassword(caller.PasswordHash, req.CurrentPassword) {
+		unauthorized(w, "current password is incorrect")
+		return
+	}
+
+	user := caller
+	if req.NewUsername != nil {
+		username, err := auth.ValidateUsername(*req.NewUsername)
+		if err != nil {
+			badRequest(w, err.Error())
+			return
+		}
+		var pgErr *pgconn.PgError
+		user, err = s.queries.UpdateUserUsername(r.Context(), db.UpdateUserUsernameParams{ID: caller.ID, Username: username})
+		switch {
+		case errors.As(err, &pgErr) && pgErr.Code == "23505":
+			conflict(w, "username already taken")
+			return
+		case err != nil:
+			internalError(w, err.Error())
+			return
+		}
+	}
+
+	if req.NewPassword != nil {
+		if len(*req.NewPassword) < 8 {
+			badRequest(w, "password must be at least 8 characters")
+			return
+		}
+		hash, err := auth.HashPassword(*req.NewPassword)
+		if err != nil {
+			internalError(w, err.Error())
+			return
+		}
+		user, err = s.queries.UpdateUserPassword(r.Context(), db.UpdateUserPasswordParams{ID: caller.ID, PasswordHash: hash})
+		if err != nil {
+			internalError(w, err.Error())
+			return
+		}
+		if cookie, err := r.Cookie(s.auth.CookieName); err == nil {
+			if err := s.queries.DeleteOtherSessionsForUser(r.Context(), db.DeleteOtherSessionsForUserParams{
+				UserID: caller.ID, TokenHash: auth.HashToken(cookie.Value),
+			}); err != nil {
+				slog.Error("delete other sessions failed", "err", err)
+			}
+		}
+	}
+
 	s.syncUserSearchIndex(r.Context(), user)
 	ok(w, newUserResponse(user))
 }

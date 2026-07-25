@@ -3,11 +3,13 @@ package ingest
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"Canto/internal/correlate"
@@ -56,31 +58,97 @@ type ProcessorSettings struct {
 	LinkOrder     []string
 	FallbackOrder []string
 	MatcherOrder  []string
-	Normalize     bool
 }
 
 // Service ties the source-processor registry and correlation engine together to resolve and record a listen.
 type Service struct {
-	registry *source.Registry
-	matchers *correlate.MatcherRegistry
-	engine   *correlate.Engine
-	queries  *db.Queries
-	lookup   *enrich.Lookup
-	rollup   *rollup.Writer
+	registry  *source.Registry
+	matchers  *correlate.MatcherRegistry
+	engine    *correlate.Engine
+	queries   *db.Queries
+	lookup    *enrich.Lookup
+	rollup    *rollup.Writer
+	enrichSem chan struct{}
 }
 
-// NewService builds a Service.
-func NewService(registry *source.Registry, matchers *correlate.MatcherRegistry, engine *correlate.Engine, queries *db.Queries, rollupWriter *rollup.Writer) *Service {
+// NewService builds a Service, backgrounding at most enrichConcurrency enrichment goroutines at once.
+func NewService(registry *source.Registry, matchers *correlate.MatcherRegistry, engine *correlate.Engine, queries *db.Queries, rollupWriter *rollup.Writer, enrichConcurrency int) *Service {
 	return &Service{
 		registry: registry, matchers: matchers, engine: engine, queries: queries,
 		lookup: enrich.NewLookup(queries, registry), rollup: rollupWriter,
+		enrichSem: make(chan struct{}, enrichConcurrency),
 	}
 }
 
-// SubmitListen resolves in's source, artists, album, and song under settings, then records the result.
-func (s *Service) SubmitListen(ctx context.Context, in ListenInput, settings ProcessorSettings, nowPlaying bool) (db.Listen, error) {
+// SubmitListen resolves in's source, artists, album, and song under settings, then records the result; imported marks in as historical, skipping live streak reconciliation.
+func (s *Service) SubmitListen(ctx context.Context, in ListenInput, settings ProcessorSettings, nowPlaying, imported bool) (db.Listen, error) {
 	slog.Debug("ingest: submit listen", "user", in.UserID, "origin_url", in.OriginURL, "song", in.SongName, "now_playing", nowPlaying)
 
+	songID, artistIDs, albumID, songDurationMs, err := s.resolveListen(ctx, in, settings, imported)
+	if err != nil {
+		return db.Listen{}, err
+	}
+
+	playedMs := in.DurationPlayedMs
+	if playedMs == 0 {
+		playedMs = songDurationMs
+	}
+
+	if nowPlaying {
+		if err := s.queries.UpsertNowPlaying(ctx, db.UpsertNowPlayingParams{
+			UserID: in.UserID, SongID: songID, DurationMs: songDurationMs,
+		}); err != nil {
+			return db.Listen{}, fmt.Errorf("ingest: upsert now playing: %w", err)
+		}
+		return db.Listen{}, nil
+	}
+
+	var clientPtr *string
+	if in.SubmissionClient != "" {
+		clientPtr = &in.SubmissionClient
+	}
+	var playedMsPtr *int32
+	if playedMs > 0 {
+		playedMsPtr = &playedMs
+	}
+	extra, err := json.Marshal(listenExtra{
+		SubmissionClientVersion:  in.SubmissionClientVersion,
+		OriginalSubmissionClient: in.OriginalSubmissionClient,
+		MediaPlayer:              in.MediaPlayer,
+		MediaPlayerVersion:       in.MediaPlayerVersion,
+		MusicService:             in.MusicService,
+		MusicServiceName:         in.MusicServiceName,
+	})
+	if err != nil {
+		return db.Listen{}, fmt.Errorf("ingest: marshal listen extra: %w", err)
+	}
+
+	listen, err := s.queries.CreateListen(ctx, db.CreateListenParams{
+		UserID:           in.UserID,
+		SongID:           songID,
+		ListenedAt:       pgtype.Timestamptz{Time: in.ListenedAt, Valid: true},
+		Client:           clientPtr,
+		DurationPlayedMs: playedMsPtr,
+		Extra:            extra,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		slog.Debug("ingest: duplicate listen ignored", "user", in.UserID, "song", songID, "listened_at", in.ListenedAt)
+		return db.Listen{}, nil
+	}
+	if err != nil {
+		return db.Listen{}, fmt.Errorf("ingest: create listen: %w", err)
+	}
+
+	s.rollup.Record(rollup.ListenEvent{
+		UserID: in.UserID, SongID: songID, ArtistIDs: artistIDs, AlbumID: albumID,
+		ListenedAt: in.ListenedAt, PlayedMs: playedMs, SongDurationMs: songDurationMs,
+		Imported: imported,
+	})
+	return listen, nil
+}
+
+// resolveListen resolves in's song, artists, and album under settings, skipping a source fetch entirely when its origin_url is already a known, linked song.
+func (s *Service) resolveListen(ctx context.Context, in ListenInput, settings ProcessorSettings, imported bool) (songID int64, artistIDs []int64, albumID *int64, durationMs int32, err error) {
 	meta := source.Metadata{SongName: in.SongName, DurationMs: in.DurationMs}
 	for _, name := range in.ArtistNames {
 		meta.Artists = append(meta.Artists, source.ArtistMetadata{Name: name})
@@ -102,6 +170,10 @@ func (s *Service) SubmitListen(ctx context.Context, in ListenInput, settings Pro
 			slog.Warn("extract id failed", "processor", p.ID(), "err", err)
 			continue
 		}
+		if knownID, knownArtists, knownAlbum, knownDuration, ok := s.knownSong(ctx, p.Type(), id); ok {
+			return knownID, knownArtists, knownAlbum, knownDuration, nil
+		}
+
 		fetched, confident, err := p.FetchMetadata(ctx, id)
 		if err != nil {
 			slog.Warn("link metadata fetch failed", "processor", p.ID(), "id", id, "err", err)
@@ -139,94 +211,75 @@ func (s *Service) SubmitListen(ctx context.Context, in ListenInput, settings Pro
 
 	matchers := s.matchers.Ordered(settings.MatcherOrder)
 
-	artistIDs := make([]int64, 0, len(meta.Artists))
+	artistNames := source.Names(meta.Artists)
+	artistIDs = make([]int64, 0, len(meta.Artists))
 	for _, artistMeta := range meta.Artists {
-		artistID, created, err := s.engine.ResolveArtist(ctx, artistMeta.Name, activeType, artistMeta.ExtractedID, rawURL, matchers, settings.Normalize)
+		artistID, created, err := s.engine.ResolveArtist(ctx, artistMeta.Name, activeType, artistMeta.ExtractedID, rawURL, matchers)
 		if err != nil {
-			return db.Listen{}, fmt.Errorf("ingest: resolve artist %q: %w", artistMeta.Name, err)
+			return 0, nil, nil, 0, fmt.Errorf("ingest: resolve artist %q: %w", artistMeta.Name, err)
 		}
 		artistIDs = append(artistIDs, artistID)
 		if created {
-			s.enrichArtist(artistID)
+			s.enrichArtist(ctx, artistID, imported)
 		}
 	}
 
-	var albumID *int64
 	if meta.Album != nil {
-		id, created, err := s.engine.ResolveAlbum(ctx, meta.Album.Name, activeType, meta.Album.ExtractedID, rawURL, artistIDs, matchers, settings.Normalize)
+		id, created, err := s.engine.ResolveAlbum(ctx, meta.Album.Name, activeType, meta.Album.ExtractedID, rawURL, artistIDs, artistNames, matchers)
 		if err != nil {
-			return db.Listen{}, fmt.Errorf("ingest: resolve album %q: %w", meta.Album.Name, err)
+			return 0, nil, nil, 0, fmt.Errorf("ingest: resolve album %q: %w", meta.Album.Name, err)
 		}
 		albumID = &id
 		if created {
-			s.enrichAlbum(id, matchers, settings.Normalize)
+			s.enrichAlbum(ctx, id, matchers, imported)
 		}
 	}
 
-	var durationMs *int32
+	var declaredDurationMs *int32
 	if meta.DurationMs > 0 {
-		durationMs = &meta.DurationMs
+		declaredDurationMs = &meta.DurationMs
 	}
-	songID, created, err := s.engine.ResolveSong(ctx, meta.SongName, activeType, extractedID, rawURL, durationMs, artistIDs, albumID, nil, matchers, settings.Normalize)
+	songID, created, err := s.engine.ResolveSong(ctx, meta.SongName, activeType, extractedID, rawURL, declaredDurationMs, artistIDs, artistNames, albumID, nil, matchers)
 	if err != nil {
-		return db.Listen{}, fmt.Errorf("ingest: resolve song %q: %w", meta.SongName, err)
+		return 0, nil, nil, 0, fmt.Errorf("ingest: resolve song %q: %w", meta.SongName, err)
 	}
 	if created && meta.ThumbnailURL != "" {
-		s.enrichSongThumbnail(songID, meta.ThumbnailURL)
+		s.enrichSongThumbnail(ctx, songID, meta.ThumbnailURL, imported)
 	}
 
-	playedMs := in.DurationPlayedMs
-	if playedMs == 0 {
-		playedMs = meta.DurationMs
+	// durationMs prefers the song's already-known DB duration over this listen's own possibly-empty fetch.
+	durationMs = meta.DurationMs
+	if song, err := s.queries.GetSongByID(ctx, songID); err == nil && song.DurationMs != nil && *song.DurationMs > 0 {
+		durationMs = *song.DurationMs
 	}
+	return songID, artistIDs, albumID, durationMs, nil
+}
 
-	if nowPlaying {
-		if err := s.queries.UpsertNowPlaying(ctx, db.UpsertNowPlayingParams{
-			UserID: in.UserID, SongID: songID, DurationMs: meta.DurationMs,
-		}); err != nil {
-			return db.Listen{}, fmt.Errorf("ingest: upsert now playing: %w", err)
-		}
-		return db.Listen{}, nil
-	}
-
-	var clientPtr *string
-	if in.SubmissionClient != "" {
-		clientPtr = &in.SubmissionClient
-	}
-	var playedMsPtr *int32
-	if playedMs > 0 {
-		playedMsPtr = &playedMs
-	}
-	extra, err := json.Marshal(listenExtra{
-		SubmissionClientVersion:  in.SubmissionClientVersion,
-		OriginalSubmissionClient: in.OriginalSubmissionClient,
-		MediaPlayer:              in.MediaPlayer,
-		MediaPlayerVersion:       in.MediaPlayerVersion,
-		MusicService:             in.MusicService,
-		MusicServiceName:         in.MusicServiceName,
-	})
+// knownSong reports whether sourceType+id already names a fully linked song, so its caller can skip a source fetch entirely.
+func (s *Service) knownSong(ctx context.Context, sourceType source.SourceType, id string) (songID int64, artistIDs []int64, albumID *int64, durationMs int32, ok bool) {
+	songID, err := s.queries.GetSourceEntityID(ctx, db.GetSourceEntityIDParams{EntityType: db.EntityTypeSong, SourceType: string(sourceType), ExtractedID: &id})
 	if err != nil {
-		return db.Listen{}, fmt.Errorf("ingest: marshal listen extra: %w", err)
+		return 0, nil, nil, 0, false
 	}
-
-	listen, err := s.queries.CreateListen(ctx, db.CreateListenParams{
-		UserID:           in.UserID,
-		SongID:           songID,
-		ListenedAt:       pgtype.Timestamptz{Time: in.ListenedAt, Valid: true},
-		Client:           clientPtr,
-		DurationPlayedMs: playedMsPtr,
-		Extra:            extra,
-	})
+	song, err := s.queries.GetSongByID(ctx, songID)
 	if err != nil {
-		return db.Listen{}, fmt.Errorf("ingest: create listen: %w", err)
+		return 0, nil, nil, 0, false
 	}
-
-	s.rollup.Record(rollup.ListenEvent{
-		UserID: in.UserID, SongID: songID, ArtistIDs: artistIDs, AlbumID: albumID,
-		ListenedAt: in.ListenedAt, PlayedMs: playedMs, SongDurationMs: meta.DurationMs,
-		Imported: in.OriginalSubmissionClient != "",
-	})
-	return listen, nil
+	artists, err := s.queries.ListArtistsForSong(ctx, songID)
+	if err != nil {
+		return 0, nil, nil, 0, false
+	}
+	artistIDs = make([]int64, len(artists))
+	for i, a := range artists {
+		artistIDs[i] = a.ID
+	}
+	if album, err := s.queries.GetAlbumForSong(ctx, songID); err == nil {
+		albumID = &album.ID
+	}
+	if song.DurationMs != nil {
+		durationMs = *song.DurationMs
+	}
+	return songID, artistIDs, albumID, durationMs, true
 }
 
 // listenExtra is the client/device metadata a listen carries beyond the correlated song itself.

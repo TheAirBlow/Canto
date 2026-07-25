@@ -23,6 +23,23 @@ type Config struct {
 	Ingest      IngestConfig      `json:"ingest"`
 	Refresh     RefreshConfig     `json:"refresh"`
 	Rollup      RollupConfig      `json:"rollup"`
+	Correlation CorrelationConfig `json:"correlation"`
+}
+
+// CorrelationConfig controls fuzzy-match candidate retrieval, scoring weights, and decision thresholds.
+type CorrelationConfig struct {
+	CandidateLimit    int     `json:"candidate_limit"`
+	ReconcilerWorkers int     `json:"reconciler_workers"`
+	PreferChinese     bool    `json:"prefer_chinese"`
+	NameWeight        float64 `json:"name_weight"`
+	ArtistWeight      float64 `json:"artist_weight"`
+	DurationWeight    float64 `json:"duration_weight"`
+	TrackWeight       float64 `json:"track_weight"`
+	AmbiguityWeight   float64 `json:"ambiguity_weight"`
+	GapFloor          float64 `json:"gap_floor"`
+	AutoAccept        float64 `json:"auto_accept"`
+	SuggestMin        float64 `json:"suggest_min"`
+	DurationVetoMs    int32   `json:"duration_veto_ms"`
 }
 
 // RollupConfig controls the stats rollup writer's batching cadence.
@@ -41,7 +58,6 @@ type ProcessorsConfig struct {
 	LinkOrder     []string `json:"link_order"`
 	FallbackOrder []string `json:"fallback_order"`
 	MatcherOrder  []string `json:"matcher_order"`
-	Normalize     bool     `json:"normalize"`
 }
 
 // IngestConfig holds the default enabled ingest endpoints.
@@ -86,7 +102,8 @@ type ProvidersConfig struct {
 
 // ImportConfig controls the bulk-import worker pool.
 type ImportConfig struct {
-	Workers int `json:"workers"`
+	Workers       int `json:"workers"`
+	EnrichWorkers int `json:"enrich_workers"`
 }
 
 // StatsConfig controls the stats_cache regeneration cadence.
@@ -115,7 +132,8 @@ func defaults() Config {
 			MusicBrainzRateLimit: 1,
 		},
 		Import: ImportConfig{
-			Workers: 32,
+			Workers:       32,
+			EnrichWorkers: 32,
 		},
 		Stats: StatsConfig{
 			RegenInterval: 5 * time.Minute,
@@ -129,8 +147,7 @@ func defaults() Config {
 		Processors: ProcessorsConfig{
 			LinkOrder:     []string{"ytmusic", "spotify", "deezer", "musicbrainz"},
 			FallbackOrder: []string{"musicbrainz", "spotify", "lastfm", "deezer"},
-			MatcherOrder:  []string{"exact", "meilisearch"},
-			Normalize:     true,
+			MatcherOrder:  []string{"exact", "trigram", "meilisearch"},
 		},
 		Ingest: IngestConfig{
 			Enabled: []string{"listenbrainz"},
@@ -141,6 +158,20 @@ func defaults() Config {
 		},
 		Rollup: RollupConfig{
 			FlushInterval: time.Second,
+		},
+		Correlation: CorrelationConfig{
+			CandidateLimit:    10,
+			ReconcilerWorkers: 4,
+			PreferChinese:     false,
+			NameWeight:        0.6,
+			ArtistWeight:      0.3,
+			DurationWeight:    0.1,
+			TrackWeight:       0.3,
+			AmbiguityWeight:   0.5,
+			GapFloor:          0.15,
+			AutoAccept:        0.82,
+			SuggestMin:        0.6,
+			DurationVetoMs:    15000,
 		},
 	}
 }
@@ -170,6 +201,7 @@ func Load(dataDir string) (Config, error) {
 	cfg.Providers.LastFMAPIKey = envString("CANTO_PROVIDERS_LASTFM_API_KEY", cfg.Providers.LastFMAPIKey)
 	cfg.Providers.LastFMAPISecret = envString("CANTO_PROVIDERS_LASTFM_API_SECRET", cfg.Providers.LastFMAPISecret)
 	cfg.Import.Workers = envInt("CANTO_IMPORT_WORKERS", cfg.Import.Workers)
+	cfg.Import.EnrichWorkers = envInt("CANTO_IMPORT_ENRICH_WORKERS", cfg.Import.EnrichWorkers)
 	cfg.Stats.RegenInterval = envDuration("CANTO_STATS_REGEN_INTERVAL", cfg.Stats.RegenInterval)
 	cfg.Auth.SessionTTL = envDuration("CANTO_AUTH_SESSION_TTL", cfg.Auth.SessionTTL)
 	cfg.Auth.CookieName = envString("CANTO_AUTH_COOKIE_NAME", cfg.Auth.CookieName)
@@ -178,11 +210,22 @@ func Load(dataDir string) (Config, error) {
 	cfg.Processors.LinkOrder = envStringSlice("CANTO_PROCESSORS_LINK_ORDER", cfg.Processors.LinkOrder)
 	cfg.Processors.FallbackOrder = envStringSlice("CANTO_PROCESSORS_FALLBACK_ORDER", cfg.Processors.FallbackOrder)
 	cfg.Processors.MatcherOrder = envStringSlice("CANTO_PROCESSORS_MATCHER_ORDER", cfg.Processors.MatcherOrder)
-	cfg.Processors.Normalize = envBool("CANTO_PROCESSORS_NORMALIZE", cfg.Processors.Normalize)
 	cfg.Ingest.Enabled = envStringSlice("CANTO_INGEST_ENABLED", cfg.Ingest.Enabled)
 	cfg.Refresh.Interval = envDuration("CANTO_REFRESH_INTERVAL", cfg.Refresh.Interval)
 	cfg.Refresh.Entities = envStringSlice("CANTO_REFRESH_ENTITIES", cfg.Refresh.Entities)
 	cfg.Rollup.FlushInterval = envDuration("CANTO_ROLLUP_FLUSH_INTERVAL", cfg.Rollup.FlushInterval)
+	cfg.Correlation.CandidateLimit = envInt("CANTO_CORRELATION_CANDIDATE_LIMIT", cfg.Correlation.CandidateLimit)
+	cfg.Correlation.ReconcilerWorkers = envInt("CANTO_CORRELATION_RECONCILER_WORKERS", cfg.Correlation.ReconcilerWorkers)
+	cfg.Correlation.PreferChinese = envBool("CANTO_CORRELATION_PREFER_CHINESE", cfg.Correlation.PreferChinese)
+	cfg.Correlation.NameWeight = envFloat("CANTO_CORRELATION_NAME_WEIGHT", cfg.Correlation.NameWeight)
+	cfg.Correlation.ArtistWeight = envFloat("CANTO_CORRELATION_ARTIST_WEIGHT", cfg.Correlation.ArtistWeight)
+	cfg.Correlation.DurationWeight = envFloat("CANTO_CORRELATION_DURATION_WEIGHT", cfg.Correlation.DurationWeight)
+	cfg.Correlation.TrackWeight = envFloat("CANTO_CORRELATION_TRACK_WEIGHT", cfg.Correlation.TrackWeight)
+	cfg.Correlation.AmbiguityWeight = envFloat("CANTO_CORRELATION_AMBIGUITY_WEIGHT", cfg.Correlation.AmbiguityWeight)
+	cfg.Correlation.GapFloor = envFloat("CANTO_CORRELATION_GAP_FLOOR", cfg.Correlation.GapFloor)
+	cfg.Correlation.AutoAccept = envFloat("CANTO_CORRELATION_AUTO_ACCEPT", cfg.Correlation.AutoAccept)
+	cfg.Correlation.SuggestMin = envFloat("CANTO_CORRELATION_SUGGEST_MIN", cfg.Correlation.SuggestMin)
+	cfg.Correlation.DurationVetoMs = int32(envInt("CANTO_CORRELATION_DURATION_VETO_MS", int(cfg.Correlation.DurationVetoMs)))
 
 	return cfg, nil
 }
@@ -205,6 +248,16 @@ func envInt(key string, def int) int {
 	if v := envString(key, ""); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			return n
+		}
+	}
+	return def
+}
+
+// envFloat reads key as a float64, falling back to def on error or absence.
+func envFloat(key string, def float64) float64 {
+	if v := envString(key, ""); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
 		}
 	}
 	return def

@@ -1,7 +1,6 @@
 package api
 
 import (
-	"encoding/json"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -12,6 +11,7 @@ import (
 
 	"Canto/internal/auth"
 	"Canto/internal/correlate"
+	"Canto/internal/correlate/romanize"
 	"Canto/internal/db"
 	"Canto/internal/images"
 	"Canto/internal/search"
@@ -23,17 +23,20 @@ func (s *Server) registerArtists(mux authMux) {
 	mux.CookieAuthHandleFunc("PUT /artists/{id}/blacklist", s.blacklistArtist)
 	mux.CookieAuthHandleFunc("DELETE /artists/{id}/blacklist", s.unblacklistArtist)
 	mux.HandleFunc("GET /artists/{id}", s.getArtist)
+	mux.AdminAuthHandleFunc("GET /artists", s.listAllArtists)
 	mux.AdminAuthHandleFunc("POST /artists", s.createArtist)
 	mux.AdminAuthHandleFunc("PUT /artists/{id}", s.updateArtist)
 	mux.AdminAuthHandleFunc("POST /artists/{id}/merge", s.mergeArtist)
+	mux.AdminAuthHandleFunc("DELETE /artists/{id}", s.deleteArtist)
 	mux.AdminAuthHandleFunc("PUT /artists/{id}/image", s.uploadArtistImage)
 	mux.AdminAuthHandleFunc("PUT /artists/{id}/pin", s.pinArtist)
 	mux.AdminAuthHandleFunc("DELETE /artists/{id}/pin", s.unpinArtist)
 	mux.HandleFunc("GET /artists/{id}/aliases", s.listArtistAliases)
 	mux.AdminAuthHandleFunc("POST /artists/{id}/aliases", s.createArtistAlias)
 	mux.AdminAuthHandleFunc("DELETE /artists/{id}/aliases/{alias_id}", s.deleteArtistAlias)
-	mux.HandleFunc("GET /artists/{id}/listens", s.listArtistListens)
-	mux.HandleFunc("GET /artists/{id}/now-playing", s.listArtistNowPlaying)
+	mux.OptionalAuthHandleFunc("GET /artists/{id}/stats", s.getArtistStats)
+	mux.OptionalAuthHandleFunc("GET /artists/{id}/listens", s.listArtistListens)
+	mux.OptionalAuthHandleFunc("GET /artists/{id}/now-playing", s.listArtistNowPlaying)
 }
 
 // artistResponse is the public-facing artist shape.
@@ -55,10 +58,9 @@ type artistDetailResponse struct {
 	artistResponse
 	Albums []albumResponse `json:"albums"`
 	Songs  []songResponse  `json:"songs"`
-	Stats  json.RawMessage `json:"stats,omitempty"`
 }
 
-// getArtist returns a single artist by id, with its full discography and global listening stats.
+// getArtist returns a single artist by id, with its full discography.
 func (s *Server) getArtist(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r)
 	if err != nil {
@@ -81,14 +83,10 @@ func (s *Server) getArtist(w http.ResponseWriter, r *http.Request) {
 		internalError(w, err.Error())
 		return
 	}
-	stats, err := s.stats.EntitySummary(r.Context(), "artist", id)
-	if err != nil {
-		slog.Warn("artist stats fetch failed", "id", id, "err", err)
-	}
 
 	resp := artistDetailResponse{
 		artistResponse: newArtistResponse(artist), Albums: make([]albumResponse, len(albums)),
-		Songs: make([]songResponse, len(songs)), Stats: stats,
+		Songs: make([]songResponse, len(songs)),
 	}
 	for i, a := range albums {
 		resp.Albums[i] = newAlbumResponse(a)
@@ -99,22 +97,66 @@ func (s *Server) getArtist(w http.ResponseWriter, r *http.Request) {
 	ok(w, resp)
 }
 
-// listArtistListens returns every listen of this artist by any user, newest first, anonymizing private users.
+// getArtistStats returns this artist's listening stats, globally or scoped to one user via ?scope=.
+func (s *Server) getArtistStats(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r)
+	if err != nil {
+		badRequest(w, err.Error())
+		return
+	}
+	userID, serr := s.resolveScope(r, scopeOrGlobal(r))
+	if serr != nil {
+		fail(w, serr.status, "stats scope", serr.detail)
+		return
+	}
+	stats, err := s.stats.EntitySummary(r.Context(), userID, "artist", id)
+	if err != nil {
+		internalError(w, err.Error())
+		return
+	}
+	ok(w, stats)
+}
+
+// listAllArtists returns a cursor-paginated page of the full artist catalog, ordered by id, for admin browsing.
+func (s *Server) listAllArtists(w http.ResponseWriter, r *http.Request) {
+	after, limit, err := parseCursorPage(r, catalogPageDefault, catalogPageMax)
+	if err != nil {
+		badRequest(w, err.Error())
+		return
+	}
+	rows, err := s.queries.ListArtists(r.Context(), db.ListArtistsParams{After: after, MaxRows: int32(limit)})
+	if err != nil {
+		internalError(w, err.Error())
+		return
+	}
+	resp := make([]artistResponse, len(rows))
+	for i, a := range rows {
+		resp[i] = newArtistResponse(a)
+	}
+	ok(w, resp)
+}
+
+// listArtistListens returns this artist's listens, globally or scoped to one user via ?scope=, anonymizing private users.
 func (s *Server) listArtistListens(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r)
 	if err != nil {
 		badRequest(w, err.Error())
 		return
 	}
+	userID, serr := s.resolveScope(r, scopeOrGlobal(r))
+	if serr != nil {
+		fail(w, serr.status, "stats scope", serr.detail)
+		return
+	}
 	page, perPage := parsePagination(r)
 	offset := int32((page - 1) * perPage)
 
-	rows, err := s.queries.ListListensForArtist(r.Context(), db.ListListensForArtistParams{ArtistID: id, MaxRows: int32(perPage), RowOffset: offset})
+	rows, err := s.queries.ListListensForArtist(r.Context(), db.ListListensForArtistParams{ArtistID: id, UserID: userID, MaxRows: int32(perPage), RowOffset: offset})
 	if err != nil {
 		internalError(w, err.Error())
 		return
 	}
-	total, err := s.queries.CountListensForArtist(r.Context(), id)
+	total, err := s.queries.CountListensForArtist(r.Context(), db.CountListensForArtistParams{ArtistID: id, UserID: userID})
 	if err != nil {
 		internalError(w, err.Error())
 		return
@@ -123,21 +165,26 @@ func (s *Server) listArtistListens(w http.ResponseWriter, r *http.Request) {
 	listens := make([]listenResponse, len(rows))
 	for i, row := range rows {
 		listens[i] = listenResponse{ListenedAt: row.ListenedAt.Time}
-		if row.Public {
+		if row.Public || userID != nil {
 			listens[i].User = &listenerResponse{ID: &row.UserID, Username: &row.Username, DisplayName: row.DisplayName, ImageURL: imageURL(row.UserImageID)}
 		}
 	}
 	ok(w, listensPage{Listens: listens, Total: total, Page: page, PerPage: perPage})
 }
 
-// listArtistNowPlaying returns every public user currently listening to this artist.
+// listArtistNowPlaying returns who's currently listening to this artist, globally or scoped to one user via ?scope=.
 func (s *Server) listArtistNowPlaying(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r)
 	if err != nil {
 		badRequest(w, err.Error())
 		return
 	}
-	rows, err := s.queries.ListNowPlayingForArtist(r.Context(), id)
+	userID, serr := s.resolveScope(r, scopeOrGlobal(r))
+	if serr != nil {
+		fail(w, serr.status, "stats scope", serr.detail)
+		return
+	}
+	rows, err := s.queries.ListNowPlayingForArtist(r.Context(), db.ListNowPlayingForArtistParams{ArtistID: id, UserID: userID})
 	if err != nil {
 		internalError(w, err.Error())
 		return
@@ -174,13 +221,13 @@ func (s *Server) createArtist(w http.ResponseWriter, r *http.Request) {
 	}
 
 	artist, err := s.queries.CreateArtist(r.Context(), db.CreateArtistParams{
-		Name: req.Name, NameNormalized: correlate.NormalizeName(req.Name),
+		Name: req.Name, NameNormalized: correlate.NormalizeName(req.Name), NameRomanized: romanize.Romanize(req.Name),
 	})
 	if err != nil {
 		internalError(w, err.Error())
 		return
 	}
-	s.search.Upsert(r.Context(), "artists", search.Document{ID: artist.ID, EntityType: "artist", Name: artist.Name, NameNormalized: artist.NameNormalized})
+	s.search.Upsert(r.Context(), "artists", search.Document{ID: artist.ID, EntityType: "artist", Name: artist.Name, NameNormalized: artist.NameNormalized, NameRomanized: artist.NameRomanized})
 	slog.Info("admin: artist created", "admin", admin.Username, "id", artist.ID, "name", artist.Name)
 	created(w, newArtistResponse(artist))
 }
@@ -212,13 +259,13 @@ func (s *Server) updateArtist(w http.ResponseWriter, r *http.Request) {
 	}
 
 	artist, err := s.queries.UpdateArtist(r.Context(), db.UpdateArtistParams{
-		ID: id, Name: req.Name, NameNormalized: correlate.NormalizeName(req.Name), Description: req.Description,
+		ID: id, Name: req.Name, NameNormalized: correlate.NormalizeName(req.Name), NameRomanized: romanize.Romanize(req.Name), Description: req.Description,
 	})
 	if err != nil {
 		internalError(w, err.Error())
 		return
 	}
-	s.search.Upsert(r.Context(), "artists", search.Document{ID: artist.ID, EntityType: "artist", Name: artist.Name, NameNormalized: artist.NameNormalized})
+	s.search.Upsert(r.Context(), "artists", search.Document{ID: artist.ID, EntityType: "artist", Name: artist.Name, NameNormalized: artist.NameNormalized, NameRomanized: artist.NameRomanized})
 	if artist.Name != before.Name {
 		s.search.CascadeArtistRename(artist.ID)
 	}
@@ -259,39 +306,7 @@ func (s *Server) mergeArtist(w http.ResponseWriter, r *http.Request) {
 	defer tx.Rollback(ctx)
 	q := s.queries.WithTx(tx)
 
-	if err := q.RepointSourcesForMerge(ctx, db.RepointSourcesForMergeParams{NewEntityID: req.Into, EntityType: db.EntityTypeArtist, OldEntityID: oldID}); err != nil {
-		internalError(w, err.Error())
-		return
-	}
-	if err := q.RepointAlbumArtistsForArtistMerge(ctx, db.RepointAlbumArtistsForArtistMergeParams{NewArtistID: req.Into, OldArtistID: oldID}); err != nil {
-		internalError(w, err.Error())
-		return
-	}
-	if err := q.DeleteRemainingAlbumArtistsForArtist(ctx, oldID); err != nil {
-		internalError(w, err.Error())
-		return
-	}
-	if err := q.RepointSongArtistsForArtistMerge(ctx, db.RepointSongArtistsForArtistMergeParams{NewArtistID: req.Into, OldArtistID: oldID}); err != nil {
-		internalError(w, err.Error())
-		return
-	}
-	if err := q.DeleteRemainingSongArtistsForArtist(ctx, oldID); err != nil {
-		internalError(w, err.Error())
-		return
-	}
-	if err := q.RepointBlacklistForArtistMerge(ctx, db.RepointBlacklistForArtistMergeParams{NewArtistID: req.Into, OldArtistID: oldID}); err != nil {
-		internalError(w, err.Error())
-		return
-	}
-	if err := q.DeleteRemainingBlacklistForArtist(ctx, oldID); err != nil {
-		internalError(w, err.Error())
-		return
-	}
-	if err := q.RepointAliases(ctx, db.RepointAliasesParams{EntityType: db.EntityTypeArtist, OldEntityID: oldID, NewEntityID: req.Into}); err != nil {
-		internalError(w, err.Error())
-		return
-	}
-	if _, err := q.DeleteArtist(ctx, oldID); err != nil {
+	if err := correlate.MergeEntity(ctx, q, db.EntityTypeArtist, oldID, req.Into); err != nil {
 		internalError(w, err.Error())
 		return
 	}
@@ -302,6 +317,50 @@ func (s *Server) mergeArtist(w http.ResponseWriter, r *http.Request) {
 
 	s.search.Delete(ctx, "artists", oldID)
 	slog.Info("admin: artist merged", "admin", admin.Username, "from", oldID, "into", req.Into)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// deleteArtist permanently removes an artist and every row keyed to it.
+func (s *Server) deleteArtist(w http.ResponseWriter, r *http.Request) {
+	admin, _ := auth.UserFromContext(r.Context())
+
+	id, err := pathID(r)
+	if err != nil {
+		badRequest(w, err.Error())
+		return
+	}
+
+	ctx := r.Context()
+	artist, err := s.queries.GetArtistByID(ctx, id)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		internalError(w, err.Error())
+		return
+	}
+	defer tx.Rollback(ctx)
+	q := s.queries.WithTx(tx)
+
+	if err := deletePolymorphicStats(ctx, q, db.EntityTypeArtist, id); err != nil {
+		internalError(w, err.Error())
+		return
+	}
+	if _, err := q.DeleteArtist(ctx, id); err != nil {
+		internalError(w, err.Error())
+		return
+	}
+	if err := tx.Commit(ctx); err != nil {
+		internalError(w, err.Error())
+		return
+	}
+
+	images.DeleteIfSet(artist.ImageID)
+	s.search.Delete(ctx, "artists", id)
+	slog.Info("admin: artist deleted", "admin", admin.Username, "id", id)
 	w.WriteHeader(http.StatusNoContent)
 }
 

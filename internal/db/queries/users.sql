@@ -27,3 +27,9 @@ UPDATE users SET display_name = $2, description = $3, public = $4 WHERE id = $1 
 
 -- name: SetUserImage :one
 UPDATE users SET image_id = $2 WHERE id = $1 RETURNING *;
+
+-- name: UpdateUserUsername :one
+UPDATE users SET username = $2 WHERE id = $1 RETURNING *;
+
+-- name: UpdateUserPassword :one
+UPDATE users SET password_hash = $2 WHERE id = $1 RETURNING *;

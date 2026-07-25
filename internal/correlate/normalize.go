@@ -9,11 +9,9 @@ import (
 	"golang.org/x/text/unicode/norm"
 )
 
-// diacriticsFold strips combining marks after NFD decomposition.
-var diacriticsFold = transform.Chain(norm.NFD, runes.Remove(runes.In(unicode.Mn)), norm.NFC)
-
 // NormalizeName lowercases, folds diacritics, strips punctuation, and collapses whitespace.
 func NormalizeName(name string) string {
+	diacriticsFold := transform.Chain(norm.NFD, runes.Remove(runes.In(unicode.Mn)), norm.NFC)
 	folded, _, err := transform.String(diacriticsFold, name)
 	if err != nil {
 		folded = name

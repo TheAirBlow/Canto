@@ -10,13 +10,16 @@ JOIN sources s ON s.entity_type = 'artist' AND s.entity_id = a.id
 WHERE s.source_type = $1 AND s.extracted_id = $2;
 
 -- name: FindArtistByExactName :one
-SELECT * FROM artists WHERE name = $1 OR name_normalized = $1 LIMIT 1;
+SELECT * FROM artists WHERE name = $1 LIMIT 1;
+
+-- name: FindArtistsByExactName :many
+SELECT * FROM artists WHERE name = $1;
 
 -- name: CreateArtist :one
-INSERT INTO artists (name, name_normalized) VALUES ($1, $2) RETURNING *;
+INSERT INTO artists (name, name_normalized, name_romanized) VALUES ($1, $2, $3) RETURNING *;
 
 -- name: UpdateArtist :one
-UPDATE artists SET name = $2, name_normalized = $3, description = $4, pinned = TRUE, updated_at = now() WHERE id = $1 RETURNING *;
+UPDATE artists SET name = $2, name_normalized = $3, name_romanized = $4, description = $5, pinned = TRUE, updated_at = now() WHERE id = $1 RETURNING *;
 
 -- name: UpdateArtistMetadata :exec
 UPDATE artists SET description = $2, image_id = $3, updated_at = now() WHERE id = $1 AND NOT pinned;

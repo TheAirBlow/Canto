@@ -21,8 +21,9 @@ type activityParams struct {
 
 // activityBucket is one zero-filled time bucket's listen count.
 type activityBucket struct {
-	Bucket      time.Time `json:"bucket"`
-	ListenCount int64     `json:"listen_count"`
+	Bucket          time.Time `json:"bucket"`
+	ListenCount     int64     `json:"listen_count"`
+	MinutesListened float64   `json:"minutes_listened"`
 }
 
 // activityResult is stats.activity's response payload.
@@ -38,6 +39,10 @@ func (e *Engine) Activity(ctx context.Context, userID *int64, tf Timeframe, step
 		return nil, fmt.Errorf("stats: invalid step %q", step)
 	}
 	from, to, err := tf.Resolve(time.Now())
+	if err != nil {
+		return nil, err
+	}
+	from, err = e.clampToEarliestListen(ctx, userID, from)
 	if err != nil {
 		return nil, err
 	}
@@ -68,7 +73,7 @@ func (e *Engine) computeActivity(ctx context.Context, userID *int64, from, to ti
 	buckets := make([]activityBucket, len(rows))
 	for i, r := range rows {
 		t, _ := r.Bucket.(time.Time)
-		buckets[i] = activityBucket{Bucket: t, ListenCount: r.ListenCount}
+		buckets[i] = activityBucket{Bucket: t, ListenCount: r.ListenCount, MinutesListened: r.MinutesListened}
 	}
 
 	result := activityResult{Buckets: buckets}

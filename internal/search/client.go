@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"Canto/internal/db"
+	"Canto/internal/httpx"
 )
 
 // cascadeQueueSize bounds how many pending rename cascades Client buffers before dropping new ones.
@@ -42,16 +43,31 @@ func (c *Client) Enabled() bool {
 // indexes lists every entity-type index this client maintains.
 var indexes = []string{"artists", "albums", "songs", "users"}
 
+// filterableAttributes lists, per index, the fields Match's generated filter expressions reference.
+var filterableAttributes = map[string][]string{
+	"albums": {"artist_ids"},
+	"songs":  {"artist_ids", "album_id"},
+}
+
+// searchableAttributes lists, per index, the fields Meilisearch matches query terms against, in relevance-ranking order.
+var searchableAttributes = map[string][]string{
+	"artists": {"name", "name_romanized", "aliases"},
+	"albums":  {"name", "name_romanized", "artist_names", "aliases"},
+	"songs":   {"name", "name_romanized", "artist_names", "album_name", "aliases"},
+}
+
 // Document is one catalog entity as indexed in Meilisearch.
 type Document struct {
 	ID             int64    `json:"id"`
 	EntityType     string   `json:"entity_type"`
 	Name           string   `json:"name"`
 	NameNormalized string   `json:"name_normalized"`
+	NameRomanized  string   `json:"name_romanized,omitempty"`
 	ArtistIDs      []int64  `json:"artist_ids,omitempty"`
 	ArtistNames    []string `json:"artist_names,omitempty"`
 	AlbumID        *int64   `json:"album_id,omitempty"`
 	AlbumName      string   `json:"album_name,omitempty"`
+	Aliases        []string `json:"aliases,omitempty"`
 }
 
 // EnsureIndexes idempotently creates every entity-type index with id as its primary key.
@@ -64,19 +80,51 @@ func (c *Client) EnsureIndexes(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("search: marshal create index %s: %w", index, err)
 		}
-		req, err := c.request(ctx, http.MethodPost, "/indexes", body)
-		if err != nil {
-			return err
+		// A 409 here means the index already exists, which is the common case after the first run.
+		createFinal := func(status int) bool {
+			return status == http.StatusOK || status == http.StatusAccepted || status == http.StatusConflict
 		}
-		resp, err := c.httpClient.Do(req)
+		resp, err := httpx.Do(ctx, c.httpClient, createFinal, func() (*http.Request, error) {
+			return c.request(ctx, http.MethodPost, "/indexes", body)
+		})
 		if err != nil {
 			return fmt.Errorf("search: create index %s: %w", index, err)
 		}
 		resp.Body.Close()
-		// A 409 here means the index already exists, which is the common case after the first run.
-		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted && resp.StatusCode != http.StatusConflict {
+		if !createFinal(resp.StatusCode) {
 			return fmt.Errorf("search: create index %s: status %d", index, resp.StatusCode)
 		}
+
+		if attrs, ok := filterableAttributes[index]; ok {
+			if err := c.putSettings(ctx, index, "filterable-attributes", attrs); err != nil {
+				return err
+			}
+		}
+		if attrs, ok := searchableAttributes[index]; ok {
+			if err := c.putSettings(ctx, index, "searchable-attributes", attrs); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// putSettings sets one Meilisearch index setting to attrs.
+func (c *Client) putSettings(ctx context.Context, index, setting string, attrs []string) error {
+	body, err := json.Marshal(attrs)
+	if err != nil {
+		return fmt.Errorf("search: marshal %s %s: %w", setting, index, err)
+	}
+	final := func(status int) bool { return status == http.StatusOK || status == http.StatusAccepted }
+	resp, err := httpx.Do(ctx, c.httpClient, final, func() (*http.Request, error) {
+		return c.request(ctx, http.MethodPut, "/indexes/"+index+"/settings/"+setting, body)
+	})
+	if err != nil {
+		return fmt.Errorf("search: set %s %s: %w", setting, index, err)
+	}
+	defer resp.Body.Close()
+	if !final(resp.StatusCode) {
+		return fmt.Errorf("search: set %s %s: status %d", setting, index, resp.StatusCode)
 	}
 	return nil
 }
@@ -91,18 +139,16 @@ func (c *Client) Upsert(ctx context.Context, entityType string, doc Document) {
 		slog.Warn("search: marshal upsert failed, skipping", "entity", entityType, "id", doc.ID, "err", err)
 		return
 	}
-	req, err := c.request(ctx, http.MethodPut, "/indexes/"+entityType+"/documents", body)
-	if err != nil {
-		slog.Warn("search: build upsert request failed, skipping", "entity", entityType, "id", doc.ID, "err", err)
-		return
-	}
-	resp, err := c.httpClient.Do(req)
+	final := func(status int) bool { return status < 300 || status == http.StatusNotFound }
+	resp, err := httpx.Do(ctx, c.httpClient, final, func() (*http.Request, error) {
+		return c.request(ctx, http.MethodPut, "/indexes/"+entityType+"/documents", body)
+	})
 	if err != nil {
 		slog.Warn("search: upsert failed, skipping", "entity", entityType, "id", doc.ID, "err", err)
 		return
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
+	if !final(resp.StatusCode) {
 		slog.Warn("search: upsert failed, skipping", "entity", entityType, "id", doc.ID, "status", resp.StatusCode)
 	}
 }
@@ -112,12 +158,9 @@ func (c *Client) Delete(ctx context.Context, entityType string, id int64) {
 	if !c.Enabled() {
 		return
 	}
-	req, err := c.request(ctx, http.MethodDelete, fmt.Sprintf("/indexes/%s/documents/%d", entityType, id), nil)
-	if err != nil {
-		slog.Warn("search: build delete request failed, skipping", "entity", entityType, "id", id, "err", err)
-		return
-	}
-	resp, err := c.httpClient.Do(req)
+	resp, err := httpx.Do(ctx, c.httpClient, httpx.OKOrNotFound, func() (*http.Request, error) {
+		return c.request(ctx, http.MethodDelete, fmt.Sprintf("/indexes/%s/documents/%d", entityType, id), nil)
+	})
 	if err != nil {
 		slog.Warn("search: delete failed, skipping", "entity", entityType, "id", id, "err", err)
 		return
@@ -127,7 +170,8 @@ func (c *Client) Delete(ctx context.Context, entityType string, id int64) {
 
 // Hit is one search result document with its relevance-ranked position preserved via slice order.
 type Hit struct {
-	ID int64 `json:"id"`
+	ID           int64   `json:"id"`
+	RankingScore float64 `json:"_rankingScore"`
 }
 
 // searchResponse is the subset of a Meilisearch search response Canto needs.
@@ -135,12 +179,12 @@ type searchResponse struct {
 	Hits []Hit `json:"hits"`
 }
 
-// Search queries entityType's index for q, optionally scoped by a Meilisearch filter expression, returning up to limit hits.
+// Search queries entityType's index for q, optionally scoped by a Meilisearch filter expression, returning up to limit hits with their ranking score populated.
 func (c *Client) Search(ctx context.Context, entityType, q, filter string, limit int) ([]Hit, error) {
 	if !c.Enabled() {
 		return nil, nil
 	}
-	query := map[string]any{"q": q, "limit": limit}
+	query := map[string]any{"q": q, "limit": limit, "showRankingScore": true}
 	if filter != "" {
 		query["filter"] = filter
 	}
@@ -148,11 +192,9 @@ func (c *Client) Search(ctx context.Context, entityType, q, filter string, limit
 	if err != nil {
 		return nil, fmt.Errorf("search: marshal query: %w", err)
 	}
-	req, err := c.request(ctx, http.MethodPost, "/indexes/"+entityType+"/search", body)
-	if err != nil {
-		return nil, err
-	}
-	resp, err := c.httpClient.Do(req)
+	resp, err := httpx.Do(ctx, c.httpClient, httpx.OKOrNotFound, func() (*http.Request, error) {
+		return c.request(ctx, http.MethodPost, "/indexes/"+entityType+"/search", body)
+	})
 	if err != nil {
 		return nil, fmt.Errorf("search: query %s: %w", entityType, err)
 	}
@@ -186,7 +228,14 @@ func (c *Client) Reindex(ctx context.Context, queries *db.Queries) error {
 			return fmt.Errorf("search: reindex list artists: %w", err)
 		}
 		for _, row := range rows {
-			c.Upsert(ctx, "artists", Document{ID: row.ID, EntityType: "artist", Name: row.Name, NameNormalized: row.NameNormalized})
+			aliases, err := aliasesFor(ctx, queries, db.EntityTypeArtist, row.ID)
+			if err != nil {
+				return err
+			}
+			c.Upsert(ctx, "artists", Document{
+				ID: row.ID, EntityType: "artist", Name: row.Name, NameNormalized: row.NameNormalized,
+				NameRomanized: row.NameRomanized, Aliases: aliases,
+			})
 			after = row.ID
 		}
 		artistCount += len(rows)
@@ -276,10 +325,27 @@ func buildAlbumDocument(ctx context.Context, queries *db.Queries, album db.Album
 	for i, a := range artists {
 		ids[i], names[i] = a.ID, a.Name
 	}
+	aliases, err := aliasesFor(ctx, queries, db.EntityTypeAlbum, album.ID)
+	if err != nil {
+		return Document{}, err
+	}
 	return Document{
-		ID: album.ID, EntityType: "album", Name: album.Name, NameNormalized: album.NameNormalized,
-		ArtistIDs: ids, ArtistNames: names,
+		ID: album.ID, EntityType: "album", Name: album.Name, NameNormalized: album.NameNormalized, NameRomanized: album.NameRomanized,
+		ArtistIDs: ids, ArtistNames: names, Aliases: aliases,
 	}, nil
+}
+
+// aliasesFor returns entityID's recorded alias strings, for indexing as a searchable attribute.
+func aliasesFor(ctx context.Context, queries *db.Queries, entityType db.EntityType, entityID int64) ([]string, error) {
+	rows, err := queries.ListAliasesForEntity(ctx, db.ListAliasesForEntityParams{EntityType: entityType, EntityID: entityID})
+	if err != nil {
+		return nil, fmt.Errorf("search: fetch aliases for %s %d: %w", entityType, entityID, err)
+	}
+	aliases := make([]string, len(rows))
+	for i, r := range rows {
+		aliases[i] = r.Alias
+	}
+	return aliases, nil
 }
 
 // buildSongDocument assembles song's search Document, including its current linked artists and album.
@@ -298,9 +364,13 @@ func buildSongDocument(ctx context.Context, queries *db.Queries, song db.Song) (
 	if album, err := queries.GetAlbumForSong(ctx, song.ID); err == nil {
 		albumID, albumName = &album.ID, album.Name
 	}
+	aliases, err := aliasesFor(ctx, queries, db.EntityTypeSong, song.ID)
+	if err != nil {
+		return Document{}, err
+	}
 	return Document{
-		ID: song.ID, EntityType: "song", Name: song.Name, NameNormalized: song.NameNormalized,
-		ArtistIDs: ids, ArtistNames: names, AlbumID: albumID, AlbumName: albumName,
+		ID: song.ID, EntityType: "song", Name: song.Name, NameNormalized: song.NameNormalized, NameRomanized: song.NameRomanized,
+		ArtistIDs: ids, ArtistNames: names, AlbumID: albumID, AlbumName: albumName, Aliases: aliases,
 	}, nil
 }
 
@@ -403,7 +473,7 @@ func (c *Client) cascadeAlbumRename(ctx context.Context, albumID int64) {
 	}
 	for _, track := range tracks {
 		song := db.Song{
-			ID: track.ID, Name: track.Name, NameNormalized: track.NameNormalized,
+			ID: track.ID, Name: track.Name, NameNormalized: track.NameNormalized, NameRomanized: track.NameRomanized,
 			DurationMs: track.DurationMs, ImageID: track.ImageID, Pinned: track.Pinned,
 			CreatedAt: track.CreatedAt, UpdatedAt: track.UpdatedAt,
 		}
@@ -415,6 +485,50 @@ func (c *Client) cascadeAlbumRename(ctx context.Context, albumID int64) {
 	}
 
 	slog.Info("search: cascaded album rename", "album", albumID, "songs", len(tracks))
+}
+
+// drainPollInterval is how often DrainIndexing checks Meilisearch's task queue.
+const drainPollInterval = 250 * time.Millisecond
+
+// drainTimeout bounds one DrainIndexing call, independent of the caller's own context.
+const drainTimeout = 5 * time.Minute
+
+// taskListResponse is the subset of a Meilisearch /tasks response DrainIndexing needs.
+type taskListResponse struct {
+	Results []struct{} `json:"results"`
+}
+
+// DrainIndexing blocks until every artists/albums/songs indexing task has finished.
+func (c *Client) DrainIndexing(ctx context.Context) error {
+	if !c.Enabled() {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, drainTimeout)
+	defer cancel()
+
+	for {
+		resp, err := httpx.Do(ctx, c.httpClient, httpx.OKOrNotFound, func() (*http.Request, error) {
+			return c.request(ctx, http.MethodGet, "/tasks?indexUids=artists,albums,songs&statuses=enqueued,processing", nil)
+		})
+		if err != nil {
+			return fmt.Errorf("search: drain indexing: %w", err)
+		}
+		var tasks taskListResponse
+		err = json.NewDecoder(resp.Body).Decode(&tasks)
+		resp.Body.Close()
+		if err != nil {
+			return fmt.Errorf("search: drain indexing: decode: %w", err)
+		}
+		if len(tasks.Results) == 0 {
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(drainPollInterval):
+		}
+	}
 }
 
 // request builds an authenticated request against path, with body as the JSON payload when non-nil.

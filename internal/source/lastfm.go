@@ -8,17 +8,20 @@ import (
 	"net/url"
 	"strconv"
 	"time"
+
+	"Canto/internal/httpx"
 )
 
 // lastFMProcessor looks up track metadata from Last.fm by artist/song text.
 type lastFMProcessor struct {
 	apiKey     string
 	httpClient *http.Client
+	lockout    httpx.Lockout
 }
 
 // NewLastFMProcessor builds the processor.
 func NewLastFMProcessor(apiKey string) Processor {
-	return &lastFMProcessor{apiKey: apiKey, httpClient: &http.Client{Timeout: 10 * time.Second}}
+	return &lastFMProcessor{apiKey: apiKey, httpClient: httpx.NewExternalClient(10 * time.Second)}
 }
 
 // ID identifies this processor in configured processor-order lists.
@@ -62,12 +65,7 @@ func (p *lastFMProcessor) FetchArtist(ctx context.Context, name string) (ArtistM
 		"https://ws.audioscrobbler.com/2.0/?method=artist.getinfo&api_key=%s&artist=%s&format=json",
 		url.QueryEscape(p.apiKey), url.QueryEscape(name),
 	)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
-	if err != nil {
-		return ArtistMetadata{}, err
-	}
-
-	resp, err := p.httpClient.Do(req)
+	resp, err := p.get(ctx, reqURL)
 	if err != nil {
 		return ArtistMetadata{}, fmt.Errorf("lastfm: fetch artist %q: %w", name, err)
 	}
@@ -113,12 +111,7 @@ func (p *lastFMProcessor) FetchMetadataByQuery(ctx context.Context, q Query) (Me
 		"https://ws.audioscrobbler.com/2.0/?method=track.getInfo&api_key=%s&artist=%s&track=%s&format=json",
 		url.QueryEscape(p.apiKey), url.QueryEscape(q.Artist), url.QueryEscape(q.Song),
 	)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
-	if err != nil {
-		return Metadata{}, false, err
-	}
-
-	resp, err := p.httpClient.Do(req)
+	resp, err := p.get(ctx, reqURL)
 	if err != nil {
 		return Metadata{}, false, fmt.Errorf("lastfm: fetch: %w", err)
 	}
@@ -148,10 +141,20 @@ func (p *lastFMProcessor) FetchMetadataByQuery(ctx context.Context, q Query) (Me
 	return meta, true, nil
 }
 
-// State reports whether Last.fm lookups are available.
-func (p *lastFMProcessor) State(context.Context) State {
-	return State{CanDetect: false, CanLookup: p.apiKey != "", CanFetchAlbum: false, CanFetchArtist: p.apiKey != ""}
+// get performs a GET request against reqURL, retrying and backing off with the rest of the pack on failure.
+func (p *lastFMProcessor) get(ctx context.Context, reqURL string) (*http.Response, error) {
+	return httpx.DoLocked(ctx, p.httpClient, &p.lockout, httpx.OKOrNotFound, func() (*http.Request, error) {
+		return http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	})
 }
+
+// State reports Last.fm's structural capabilities, regardless of whether it's currently configured.
+func (p *lastFMProcessor) State(context.Context) State {
+	return State{CanDetect: false, CanLookup: true, CanFetchAlbum: false, CanFetchArtist: true}
+}
+
+// Available reports whether an API key is configured.
+func (p *lastFMProcessor) Available() bool { return p.apiKey != "" }
 
 // Type identifies this processor's source_type.
 func (p *lastFMProcessor) Type() SourceType { return SourceTypeLastfm }

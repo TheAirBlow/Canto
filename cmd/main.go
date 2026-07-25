@@ -18,6 +18,7 @@ import (
 	"Canto/internal/auth"
 	"Canto/internal/config"
 	"Canto/internal/correlate"
+	"Canto/internal/correlate/romanize"
 	"Canto/internal/db"
 	"Canto/internal/export"
 	"Canto/internal/importer"
@@ -66,7 +67,12 @@ func run() error {
 		return fmt.Errorf("db: migrate: %w", err)
 	}
 
-	pool, err := pgxpool.New(ctx, cfg.Database.URL)
+	poolCfg, err := pgxpool.ParseConfig(cfg.Database.URL)
+	if err != nil {
+		return fmt.Errorf("db: pool config: %w", err)
+	}
+	poolCfg.MaxConns = int32(max(cfg.Import.Workers+20, 30)) // pgxpool defaults to 4, far too few for Import.Workers concurrent goroutines
+	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		return fmt.Errorf("db: pool: %w", err)
 	}
@@ -75,6 +81,20 @@ func run() error {
 
 	if err := queries.DeleteAllNowPlaying(ctx); err != nil {
 		return fmt.Errorf("db: clear now playing: %w", err)
+	}
+
+	state, err := queries.GetServerState(ctx)
+	if err != nil {
+		return fmt.Errorf("db: get server state: %w", err)
+	}
+	if !state {
+		slog.Warn("canto: previous shutdown was unclean, recomputing rollup stats from scratch")
+		if err := rollup.RecomputeAll(ctx, pool, queries); err != nil {
+			return fmt.Errorf("rollup: recompute after unclean shutdown: %w", err)
+		}
+	}
+	if err := queries.MarkServerRunning(ctx); err != nil {
+		return fmt.Errorf("db: mark server running: %w", err)
 	}
 
 	if err := bootstrapAdmin(ctx, queries); err != nil {
@@ -95,15 +115,29 @@ func run() error {
 		}
 	}
 	go searchClient.Run(ctx)
+	romanize.PreferChinese = cfg.Correlation.PreferChinese
 	matchers := correlate.NewMatcherRegistry(
 		correlate.NewExactMatcher(queries),
-		correlate.NewMeilisearchMatcher(searchClient),
+		correlate.NewTrigramMatcher(queries, int32(cfg.Correlation.CandidateLimit)),
+		correlate.NewMeilisearchMatcher(searchClient, cfg.Correlation.CandidateLimit),
 	)
-	engine := correlate.NewEngine(pool, searchClient)
-
-	// rollupWriter's ctx outlives the shutdown signal until importManager.Wait() returns.
+	scoring := correlate.ScoringConfig{
+		NameWeight: cfg.Correlation.NameWeight, ArtistWeight: cfg.Correlation.ArtistWeight,
+		DurationWeight: cfg.Correlation.DurationWeight, TrackWeight: cfg.Correlation.TrackWeight,
+		AmbiguityWeight: cfg.Correlation.AmbiguityWeight,
+		GapFloor:        cfg.Correlation.GapFloor, AutoAccept: cfg.Correlation.AutoAccept,
+		SuggestMin: cfg.Correlation.SuggestMin, DurationVetoMs: cfg.Correlation.DurationVetoMs,
+	}
+	// rollupCtx outlives the shutdown signal until importManager.Wait() returns.
 	rollupCtx, stopRollup := context.WithCancel(context.Background())
 	defer stopRollup()
+
+	reconciler := correlate.NewReconciler(pool, queries, searchClient, matchers.Ordered(cfg.Processors.MatcherOrder), scoring)
+	for range cfg.Correlation.ReconcilerWorkers {
+		go reconciler.Run(rollupCtx)
+	}
+	engine := correlate.NewEngine(pool, searchClient, scoring, reconciler)
+
 	rollupWriter := rollup.NewWriter(queries, cfg.Rollup.FlushInterval)
 	rollupDone := make(chan struct{})
 	go func() {
@@ -111,26 +145,35 @@ func run() error {
 		rollupWriter.Run(rollupCtx)
 	}()
 
-	service := ingest.NewService(registry, matchers, engine, queries, rollupWriter)
+	unrecorder := rollup.NewUnrecorder(pool, queries)
+	unrecorderDone := make(chan struct{})
+	go func() {
+		defer close(unrecorderDone)
+		unrecorder.Run(rollupCtx)
+	}()
 
-	importManager := importer.NewManager(ctx, pool, queries, service, cfg.Processors, cfg.Import.Workers, config.DataDir)
+	service := ingest.NewService(registry, matchers, engine, queries, rollupWriter, cfg.Import.EnrichWorkers)
+
+	statsEngine := stats.NewEngine(queries, cfg.Stats.RegenInterval)
+	go statsEngine.Run(ctx)
+
+	importManager := importer.NewManager(ctx, pool, queries, service, searchClient, statsEngine, cfg.Processors, cfg.Import.Workers, config.DataDir)
 	if err := importManager.ResumeInterruptedJobs(ctx); err != nil {
 		slog.Warn("importer: resume interrupted jobs failed", "err", err)
 	}
 
 	exportService := export.NewService(queries)
-	statsEngine := stats.NewEngine(queries, cfg.Stats.RegenInterval)
-	go statsEngine.Run(ctx)
 
 	apiServer := api.NewServer(api.Deps{
 		Queries: queries, Pool: pool, Auth: cfg.Auth, Defaults: cfg.Processors,
 		IngestDefaults: cfg.Ingest, Providers: cfg.Providers, Ingest: service,
 		Search: searchClient, Importer: importManager, Export: exportService, Stats: statsEngine,
+		Registry: registry, Matchers: matchers, Unrecorder: unrecorder,
 	})
 
 	refreshWorker := refresh.NewWorker(
 		refresh.Config{Interval: cfg.Refresh.Interval, Entities: cfg.Refresh.Entities},
-		queries, registry, engine, matchers.Ordered(cfg.Processors.MatcherOrder), cfg.Processors.Normalize,
+		queries, registry, engine, matchers.Ordered(cfg.Processors.MatcherOrder),
 	)
 	if refreshWorker.Enabled() {
 		go refreshWorker.Run(ctx)
@@ -166,6 +209,11 @@ func run() error {
 
 	stopRollup()
 	<-rollupDone
+	<-unrecorderDone
+
+	if err := queries.MarkServerShutdownClean(context.Background()); err != nil {
+		slog.Warn("db: mark server shutdown clean failed", "err", err)
+	}
 	slog.Info("canto stopped")
 	return nil
 }
@@ -189,7 +237,7 @@ func bootstrapAdmin(ctx context.Context, queries *db.Queries) error {
 	}); err != nil {
 		return err
 	}
-	slog.Warn("no admin account existed, created default admin -- change its password immediately",
+	slog.Warn("created default admin account, change its password immediately",
 		"username", bootstrapAdminUsername, "password", bootstrapAdminPassword)
 	return nil
 }

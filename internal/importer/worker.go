@@ -25,8 +25,11 @@ func (m *Manager) runAsync(job db.ImportJob, startIdx int) {
 	}()
 }
 
-// runJob parses job's file from startIdx onward and submits every entry through the shared worker pool; if the Manager's context is canceled mid-run, dispatched entries finish and the job is marked paused.
+// runJob parses job's file from startIdx onward and submits every entry through the shared worker pool.
 func (m *Manager) runJob(job db.ImportJob, startIdx int) {
+	m.runMu.Lock()
+	defer m.runMu.Unlock()
+
 	jobCtx, cancel := context.WithTimeout(m.ctx, runTimeout)
 	defer cancel()
 
@@ -101,6 +104,12 @@ consume:
 	if err := rollup.ReconcileUserState(context.Background(), m.queries, job.UserID); err != nil {
 		slog.Error("importer: reconcile listen state failed", "id", job.ID, "err", err)
 	}
+	if err := m.stats.InvalidateUser(context.Background(), job.UserID); err != nil {
+		slog.Error("importer: stats cache invalidate failed", "id", job.ID, "err", err)
+	}
+	if err := m.search.DrainIndexing(context.Background()); err != nil {
+		slog.Warn("importer: drain search indexing failed", "id", job.ID, "err", err)
+	}
 	m.finishJob(context.Background(), job.ID, db.ImportStatusCompleted, "")
 }
 
@@ -112,7 +121,7 @@ func (m *Manager) processEntry(ctx context.Context, jobID int64, in ingest.Liste
 	case in.SongName == "" && in.OriginURL == "":
 		progress.Skipped = 1
 	default:
-		if _, err := m.ingest.SubmitListen(ctx, in, settings, false); err != nil {
+		if _, err := m.ingest.SubmitListen(ctx, in, settings, false, true); err != nil {
 			slog.Warn("importer: submit listen failed", "job", jobID, "err", err)
 			progress.Failed = 1
 		} else {
@@ -149,7 +158,6 @@ type settingsDoc struct {
 	LinkProcessors     []string `json:"link_processors"`
 	FallbackProcessors []string `json:"fallback_processors"`
 	FuzzyMatchers      []string `json:"fuzzy_matchers"`
-	FuzzyNormalize     bool     `json:"fuzzy_normalize"`
 }
 
 // resolveSettings loads userID's stored processor settings, falling back to Canto's configured defaults.
@@ -158,7 +166,7 @@ func (m *Manager) resolveSettings(ctx context.Context, userID int64) (ingest.Pro
 	if err != nil {
 		return ingest.ProcessorSettings{
 			LinkOrder: m.defaults.LinkOrder, FallbackOrder: m.defaults.FallbackOrder,
-			MatcherOrder: m.defaults.MatcherOrder, Normalize: m.defaults.Normalize,
+			MatcherOrder: m.defaults.MatcherOrder,
 		}, nil
 	}
 
@@ -168,6 +176,6 @@ func (m *Manager) resolveSettings(ctx context.Context, userID int64) (ingest.Pro
 	}
 	return ingest.ProcessorSettings{
 		LinkOrder: doc.LinkProcessors, FallbackOrder: doc.FallbackProcessors,
-		MatcherOrder: doc.FuzzyMatchers, Normalize: doc.FuzzyNormalize,
+		MatcherOrder: doc.FuzzyMatchers,
 	}, nil
 }

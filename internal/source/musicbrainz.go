@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"golang.org/x/time/rate"
+
+	"Canto/internal/httpx"
 )
 
 // mbidPattern matches a MusicBrainz recording page URL, capturing the MBID.
@@ -22,6 +24,7 @@ type musicBrainzProcessor struct {
 	baseURL    string
 	httpClient *http.Client
 	limiter    *rate.Limiter
+	lockout    httpx.Lockout
 }
 
 // NewMusicBrainzProcessor builds the processor against baseURL, rate-limited to requestsPerSecond (<= 0 means unlimited).
@@ -32,7 +35,7 @@ func NewMusicBrainzProcessor(baseURL string, requestsPerSecond int) Processor {
 	}
 	return &musicBrainzProcessor{
 		baseURL:    strings.TrimRight(baseURL, "/"),
-		httpClient: &http.Client{Timeout: 10 * time.Second},
+		httpClient: httpx.NewExternalClient(10 * time.Second),
 		limiter:    rate.NewLimiter(limit, 1),
 	}
 }
@@ -232,13 +235,14 @@ func (p *musicBrainzProcessor) get(ctx context.Context, reqURL string, out any) 
 	}
 	slog.Debug("musicbrainz: request", "url", reqURL)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("User-Agent", "Canto/0.1 (+https://github.com/canto)")
-
-	resp, err := p.httpClient.Do(req)
+	resp, err := httpx.DoLocked(ctx, p.httpClient, &p.lockout, httpx.OKOrNotFound, func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("User-Agent", "Canto/0.1 (+https://github.com/canto)")
+		return req, nil
+	})
 	if err != nil {
 		return fmt.Errorf("musicbrainz: fetch %s: %w", reqURL, err)
 	}

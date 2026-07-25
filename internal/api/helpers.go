@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -16,12 +17,48 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+// catalogPageDefault/catalogPageMax bound admin catalog browse pages (GET /artists, /albums, /songs).
+const (
+	catalogPageDefault = 30
+	catalogPageMax     = 100
+)
+
+// parseCursorPage reads after/limit query params for an id-cursor-paginated list, clamping limit to [1, maxLimit].
+func parseCursorPage(r *http.Request, defaultLimit, maxLimit int) (after int64, limit int, err error) {
+	if raw := r.URL.Query().Get("after"); raw != "" {
+		after, err = strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			return 0, 0, fmt.Errorf("invalid after")
+		}
+	}
+	limit = defaultLimit
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		v, err := strconv.Atoi(raw)
+		if err != nil || v <= 0 {
+			return 0, 0, fmt.Errorf("invalid limit")
+		}
+		limit = v
+	}
+	if limit > maxLimit {
+		limit = maxLimit
+	}
+	return after, limit, nil
+}
+
+// scopeOrGlobal reads the ?scope= query param, defaulting to "global" when unset.
+func scopeOrGlobal(r *http.Request) string {
+	if raw := r.URL.Query().Get("scope"); raw != "" {
+		return raw
+	}
+	return "global"
+}
+
 // imageURL builds a "medium" size image URL for id, or nil if id is unset.
 func imageURL(id pgtype.UUID) *string {
 	if !id.Valid {
 		return nil
 	}
-	url := fmt.Sprintf("/images/%s/medium", uuid.UUID(id.Bytes).String())
+	url := fmt.Sprintf("/api/images/%s/medium", uuid.UUID(id.Bytes).String())
 	return &url
 }
 
@@ -135,6 +172,22 @@ func (m authMux) CookieAuthHandleFunc(pattern string, handler http.HandlerFunc) 
 		if err != nil {
 			if isAuthError(err) {
 				unauthorized(w, err.Error())
+			} else {
+				internalError(w, err.Error())
+			}
+			return
+		}
+		handler.ServeHTTP(w, r.WithContext(auth.ContextWithUser(r.Context(), user)))
+	}))
+}
+
+// OptionalAuthHandleFunc registers handler on pattern, attaching the user if a session cookie is valid, else proceeding anonymously.
+func (m authMux) OptionalAuthHandleFunc(pattern string, handler http.HandlerFunc) {
+	m.Handle(pattern, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user, err := m.server.authenticateCookie(r)
+		if err != nil {
+			if isAuthError(err) {
+				handler(w, r)
 			} else {
 				internalError(w, err.Error())
 			}

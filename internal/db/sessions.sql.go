@@ -43,6 +43,20 @@ func (q *Queries) DeleteExpiredSessions(ctx context.Context) error {
 	return err
 }
 
+const deleteOtherSessionsForUser = `-- name: DeleteOtherSessionsForUser :exec
+DELETE FROM sessions WHERE user_id = $1 AND token_hash != $2
+`
+
+type DeleteOtherSessionsForUserParams struct {
+	UserID    int64  `json:"user_id"`
+	TokenHash string `json:"token_hash"`
+}
+
+func (q *Queries) DeleteOtherSessionsForUser(ctx context.Context, arg DeleteOtherSessionsForUserParams) error {
+	_, err := q.db.Exec(ctx, deleteOtherSessionsForUser, arg.UserID, arg.TokenHash)
+	return err
+}
+
 const deleteSession = `-- name: DeleteSession :exec
 DELETE FROM sessions WHERE token_hash = $1
 `

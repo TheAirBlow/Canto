@@ -43,7 +43,7 @@ type bufferedEvent struct {
 	artistIDs  []int64
 	albumID    *int64
 	listenedAt time.Time
-	minutesMs  int64
+	playedMs   int64
 	imported   bool
 }
 
@@ -70,15 +70,15 @@ func (w *Writer) Record(evt ListenEvent) {
 	if !Eligible(evt.PlayedMs, evt.SongDurationMs) {
 		return
 	}
-	minutesMs := evt.PlayedMs
-	if minutesMs == 0 {
-		minutesMs = evt.SongDurationMs
+	playedMs := evt.PlayedMs
+	if playedMs == 0 {
+		playedMs = evt.SongDurationMs
 	}
 
 	w.mu.Lock()
 	w.events = append(w.events, bufferedEvent{
 		userID: evt.UserID, songID: evt.SongID, artistIDs: evt.ArtistIDs, albumID: evt.AlbumID,
-		listenedAt: evt.ListenedAt, minutesMs: int64(minutesMs), imported: evt.Imported,
+		listenedAt: evt.ListenedAt, playedMs: int64(playedMs), imported: evt.Imported,
 	})
 	n := len(w.events)
 	w.mu.Unlock()
@@ -115,8 +115,8 @@ type dailyKey struct {
 }
 
 type dailyDelta struct {
-	count     int32
-	minutesMs int64
+	count    int32
+	playedMs int64
 }
 
 type clockKey struct {
@@ -137,11 +137,12 @@ type entityKey struct {
 }
 
 type entityDelta struct {
-	plays   int32
-	firstAt time.Time
+	plays    int32
+	playedMs int64
+	firstAt  time.Time
 }
 
-// flush snapshots the buffer, drops blacklisted (user, song) pairs, aggregates the rest, and issues one batched upsert per table.
+// flush snapshots the buffer, aggregates it, and issues one batched upsert per table.
 func (w *Writer) flush(ctx context.Context) {
 	w.mu.Lock()
 	if len(w.events) == 0 {
@@ -151,8 +152,6 @@ func (w *Writer) flush(ctx context.Context) {
 	events := w.events
 	w.events = nil
 	w.mu.Unlock()
-
-	blacklisted := w.blacklistedPairs(ctx, events)
 
 	daily := make(map[dailyKey]*dailyDelta)
 	clock := make(map[clockKey]int32)
@@ -165,23 +164,20 @@ func (w *Writer) flush(ctx context.Context) {
 			firstSeen[k] = at
 		}
 	}
-	touchEntity := func(k entityKey, at time.Time) {
+	touchEntity := func(k entityKey, at time.Time, playedMs int64) {
 		e := entities[k]
 		if e == nil {
-			entities[k] = &entityDelta{plays: 1, firstAt: at}
+			entities[k] = &entityDelta{plays: 1, playedMs: playedMs, firstAt: at}
 			return
 		}
 		e.plays++
+		e.playedMs += playedMs
 		if at.Before(e.firstAt) {
 			e.firstAt = at
 		}
 	}
 
 	for _, e := range events {
-		if blacklisted[[2]int64{e.userID, e.songID}] {
-			continue // a later un-blacklist won't retroactively restore rows skipped here
-		}
-
 		day := civilDay(e.listenedAt)
 		dk := dailyKey{e.userID, e.songID, day}
 		d := daily[dk]
@@ -190,19 +186,19 @@ func (w *Writer) flush(ctx context.Context) {
 			daily[dk] = d
 		}
 		d.count++
-		d.minutesMs += e.minutesMs
+		d.playedMs += e.playedMs
 
 		clock[clockKey{e.userID, day, int16(e.listenedAt.UTC().Hour())}]++
 
 		touchFirstSeen(firstSeenKey{e.userID, db.EntityTypeSong, e.songID}, e.listenedAt)
-		touchEntity(entityKey{db.EntityTypeSong, e.songID}, e.listenedAt)
+		touchEntity(entityKey{db.EntityTypeSong, e.songID}, e.listenedAt, e.playedMs)
 		if e.albumID != nil {
 			touchFirstSeen(firstSeenKey{e.userID, db.EntityTypeAlbum, *e.albumID}, e.listenedAt)
-			touchEntity(entityKey{db.EntityTypeAlbum, *e.albumID}, e.listenedAt)
+			touchEntity(entityKey{db.EntityTypeAlbum, *e.albumID}, e.listenedAt, e.playedMs)
 		}
 		for _, artistID := range e.artistIDs {
 			touchFirstSeen(firstSeenKey{e.userID, db.EntityTypeArtist, artistID}, e.listenedAt)
-			touchEntity(entityKey{db.EntityTypeArtist, artistID}, e.listenedAt)
+			touchEntity(entityKey{db.EntityTypeArtist, artistID}, e.listenedAt, e.playedMs)
 		}
 
 		if !e.imported {
@@ -219,35 +215,6 @@ func (w *Writer) flush(ctx context.Context) {
 	}
 }
 
-// blacklistedPairs returns which (user_id, song_id) pairs touched by events are currently blacklisted.
-func (w *Writer) blacklistedPairs(ctx context.Context, events []bufferedEvent) map[[2]int64]bool {
-	userSet := make(map[int64]struct{})
-	songSet := make(map[int64]struct{})
-	for _, e := range events {
-		userSet[e.userID] = struct{}{}
-		songSet[e.songID] = struct{}{}
-	}
-	userIDs := make([]int64, 0, len(userSet))
-	for id := range userSet {
-		userIDs = append(userIDs, id)
-	}
-	songIDs := make([]int64, 0, len(songSet))
-	for id := range songSet {
-		songIDs = append(songIDs, id)
-	}
-
-	rows, err := w.queries.CheckBlacklistedSongs(ctx, db.CheckBlacklistedSongsParams{UserIds: userIDs, SongIds: songIDs})
-	if err != nil {
-		slog.Error("rollup: check blacklisted songs failed", "err", err)
-		return nil
-	}
-	out := make(map[[2]int64]bool, len(rows))
-	for _, r := range rows {
-		out[[2]int64{r.UserID, r.SongID}] = true
-	}
-	return out
-}
-
 func (w *Writer) flushDaily(ctx context.Context, daily map[dailyKey]*dailyDelta) {
 	if len(daily) == 0 {
 		return
@@ -258,7 +225,7 @@ func (w *Writer) flushDaily(ctx context.Context, daily map[dailyKey]*dailyDelta)
 		p.SongIds = append(p.SongIds, k.songID)
 		p.Days = append(p.Days, pgtype.Date{Time: k.day, Valid: true})
 		p.ListenCounts = append(p.ListenCounts, d.count)
-		p.MinutesMs = append(p.MinutesMs, d.minutesMs)
+		p.PlayedMs = append(p.PlayedMs, d.playedMs)
 	}
 	if err := w.queries.UpsertDailySongListens(ctx, p); err != nil {
 		slog.Error("rollup: upsert daily song listens failed", "err", err)
@@ -326,6 +293,7 @@ func (w *Writer) flushEntityPlays(ctx context.Context, entities map[entityKey]*e
 		p.EntityTypes = append(p.EntityTypes, string(k.entityType))
 		p.EntityIds = append(p.EntityIds, k.entityID)
 		p.Plays = append(p.Plays, d.plays)
+		p.PlayedMs = append(p.PlayedMs, d.playedMs)
 		p.FirstAts = append(p.FirstAts, pgtype.Timestamptz{Time: d.firstAt, Valid: true})
 	}
 	if err := w.queries.UpsertEntityGlobalPlays(ctx, p); err != nil {

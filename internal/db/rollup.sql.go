@@ -33,47 +33,6 @@ func (q *Queries) BumpEntityGlobalUniqueListeners(ctx context.Context, arg BumpE
 	return err
 }
 
-const checkBlacklistedSongs = `-- name: CheckBlacklistedSongs :many
-SELECT DISTINCT bl.user_id, sa.song_id
-FROM artist_blacklist bl
-JOIN song_artists sa ON sa.artist_id = bl.artist_id
-WHERE bl.user_id = ANY($1::bigint[])
-  AND sa.song_id = ANY($2::bigint[])
-`
-
-type CheckBlacklistedSongsParams struct {
-	UserIds []int64 `json:"user_ids"`
-	SongIds []int64 `json:"song_ids"`
-}
-
-type CheckBlacklistedSongsRow struct {
-	UserID int64 `json:"user_id"`
-	SongID int64 `json:"song_id"`
-}
-
-// Returns every (user_id, song_id) pair, from the sets given, that is currently blacklisted.
-// The two arrays are checked as independent sets, not paired positionally, so callers must
-// re-check membership of their own (user_id, song_id) pairs against the result.
-func (q *Queries) CheckBlacklistedSongs(ctx context.Context, arg CheckBlacklistedSongsParams) ([]CheckBlacklistedSongsRow, error) {
-	rows, err := q.db.Query(ctx, checkBlacklistedSongs, arg.UserIds, arg.SongIds)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var items []CheckBlacklistedSongsRow
-	for rows.Next() {
-		var i CheckBlacklistedSongsRow
-		if err := rows.Scan(&i.UserID, &i.SongID); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
 const computeUserStreak = `-- name: ComputeUserStreak :one
 WITH days AS (
     SELECT DISTINCT day FROM daily_song_listens WHERE user_id = $1::bigint
@@ -191,10 +150,6 @@ WITH eligible_listens AS (
     WHERE (s.duration_ms IS NULL OR s.duration_ms <= 0
            OR coalesce(l.duration_played_ms, s.duration_ms, 0) * 2 >= s.duration_ms
            OR coalesce(l.duration_played_ms, s.duration_ms, 0) >= 240000)
-      AND NOT EXISTS (
-        SELECT 1 FROM artist_blacklist bl JOIN song_artists sa ON sa.artist_id = bl.artist_id
-        WHERE bl.user_id = l.user_id AND sa.song_id = l.song_id
-      )
 )
 INSERT INTO clock_cells (user_id, day, hour, listen_count)
 SELECT user_id, (listened_at AT TIME ZONE 'UTC')::date, extract(hour FROM listened_at AT TIME ZONE 'UTC')::smallint, count(*)::int
@@ -216,12 +171,8 @@ WITH eligible_listens AS (
     WHERE (s.duration_ms IS NULL OR s.duration_ms <= 0
            OR coalesce(l.duration_played_ms, s.duration_ms, 0) * 2 >= s.duration_ms
            OR coalesce(l.duration_played_ms, s.duration_ms, 0) >= 240000)
-      AND NOT EXISTS (
-        SELECT 1 FROM artist_blacklist bl JOIN song_artists sa ON sa.artist_id = bl.artist_id
-        WHERE bl.user_id = l.user_id AND sa.song_id = l.song_id
-      )
 )
-INSERT INTO daily_song_listens (user_id, song_id, day, listen_count, minutes_ms)
+INSERT INTO daily_song_listens (user_id, song_id, day, listen_count, played_ms)
 SELECT user_id, song_id, (listened_at AT TIME ZONE 'UTC')::date, count(*)::int, coalesce(sum(played_ms), 0)::bigint
 FROM eligible_listens
 GROUP BY user_id, song_id, (listened_at AT TIME ZONE 'UTC')::date
@@ -242,10 +193,6 @@ WITH eligible_listens AS (
     WHERE (s.duration_ms IS NULL OR s.duration_ms <= 0
            OR coalesce(l.duration_played_ms, s.duration_ms, 0) * 2 >= s.duration_ms
            OR coalesce(l.duration_played_ms, s.duration_ms, 0) >= 240000)
-      AND NOT EXISTS (
-        SELECT 1 FROM artist_blacklist bl JOIN song_artists sa ON sa.artist_id = bl.artist_id
-        WHERE bl.user_id = l.user_id AND sa.song_id = l.song_id
-      )
 )
 INSERT INTO user_entity_first_listen (user_id, entity_type, entity_id, first_at)
 SELECT user_id, 'song'::entity_type, song_id, min(listened_at) FROM eligible_listens GROUP BY user_id, song_id
@@ -273,20 +220,17 @@ WITH eligible_listens AS (
     WHERE (s.duration_ms IS NULL OR s.duration_ms <= 0
            OR coalesce(l.duration_played_ms, s.duration_ms, 0) * 2 >= s.duration_ms
            OR coalesce(l.duration_played_ms, s.duration_ms, 0) >= 240000)
-      AND NOT EXISTS (
-        SELECT 1 FROM artist_blacklist bl JOIN song_artists sa ON sa.artist_id = bl.artist_id
-        WHERE bl.user_id = l.user_id AND sa.song_id = l.song_id
-      )
 )
-INSERT INTO entity_global_stats (entity_type, entity_id, plays, unique_listeners, first_listened_at)
-SELECT entity_type, entity_id, count(*)::int AS plays, count(DISTINCT user_id)::int AS unique_listeners, min(first_at)
+INSERT INTO entity_global_stats (entity_type, entity_id, plays, unique_listeners, played_ms, first_listened_at)
+SELECT entity_type, entity_id, count(*)::int AS plays, count(DISTINCT user_id)::int AS unique_listeners,
+       coalesce(sum(played_ms), 0)::bigint AS played_ms, min(first_at)
 FROM (
-    SELECT user_id, 'song'::entity_type AS entity_type, song_id AS entity_id, listened_at AS first_at FROM eligible_listens
+    SELECT user_id, 'song'::entity_type AS entity_type, song_id AS entity_id, listened_at AS first_at, played_ms FROM eligible_listens
     UNION ALL
-    SELECT el.user_id, 'album'::entity_type, sa.album_id, el.listened_at
+    SELECT el.user_id, 'album'::entity_type, sa.album_id, el.listened_at, el.played_ms
     FROM eligible_listens el JOIN song_albums sa ON sa.song_id = el.song_id
     UNION ALL
-    SELECT el.user_id, 'artist'::entity_type, sar.artist_id, el.listened_at
+    SELECT el.user_id, 'artist'::entity_type, sar.artist_id, el.listened_at, el.played_ms
     FROM eligible_listens el JOIN song_artists sar ON sar.song_id = el.song_id
 ) t
 GROUP BY entity_type, entity_id
@@ -329,7 +273,7 @@ func (q *Queries) RebuildUserListenStates(ctx context.Context) error {
 
 const rollupActivityBuckets = `-- name: RollupActivityBuckets :many
 WITH scoped AS (
-    SELECT user_id, song_id, day, listen_count, minutes_ms FROM daily_song_listens dsl
+    SELECT user_id, song_id, day, listen_count, played_ms FROM daily_song_listens dsl
     WHERE ($4::bigint IS NULL OR dsl.user_id = $4::bigint)
       AND ($5::bigint IS NULL OR EXISTS (
             SELECT 1 FROM song_artists sar WHERE sar.song_id = dsl.song_id AND sar.artist_id = $5::bigint))
@@ -337,7 +281,8 @@ WITH scoped AS (
             SELECT 1 FROM song_albums sa2 WHERE sa2.song_id = dsl.song_id AND sa2.album_id = $6::bigint))
       AND ($7::bigint IS NULL OR dsl.song_id = $7::bigint)
 )
-SELECT gs.bucket, coalesce(sum(sc.listen_count), 0)::bigint AS listen_count
+SELECT gs.bucket, coalesce(sum(sc.listen_count), 0)::bigint AS listen_count,
+       (coalesce(sum(sc.played_ms), 0)::float8 / 60000.0)::float8 AS minutes_listened
 FROM generate_series($1::timestamptz, $2::timestamptz, $3::interval) AS gs(bucket)
 LEFT JOIN scoped sc
   ON (sc.day::timestamp AT TIME ZONE 'UTC') >= gs.bucket AND (sc.day::timestamp AT TIME ZONE 'UTC') < gs.bucket + $3::interval
@@ -355,8 +300,9 @@ type RollupActivityBucketsParams struct {
 }
 
 type RollupActivityBucketsRow struct {
-	Bucket      interface{} `json:"bucket"`
-	ListenCount int64       `json:"listen_count"`
+	Bucket          interface{} `json:"bucket"`
+	ListenCount     int64       `json:"listen_count"`
+	MinutesListened float64     `json:"minutes_listened"`
 }
 
 func (q *Queries) RollupActivityBuckets(ctx context.Context, arg RollupActivityBucketsParams) ([]RollupActivityBucketsRow, error) {
@@ -376,7 +322,7 @@ func (q *Queries) RollupActivityBuckets(ctx context.Context, arg RollupActivityB
 	var items []RollupActivityBucketsRow
 	for rows.Next() {
 		var i RollupActivityBucketsRow
-		if err := rows.Scan(&i.Bucket, &i.ListenCount); err != nil {
+		if err := rows.Scan(&i.Bucket, &i.ListenCount, &i.MinutesListened); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -420,15 +366,22 @@ func (q *Queries) RollupAvgSessionLengthMs(ctx context.Context, arg RollupAvgSes
 }
 
 const rollupClockGrid = `-- name: RollupClockGrid :many
-SELECT extract(dow FROM day)::smallint AS day_of_week, hour, sum(listen_count)::bigint AS listen_count
-FROM clock_cells
-WHERE ($1::bigint IS NULL OR user_id = $1::bigint)
-  AND day >= $2::date
-  AND day < $3::date
-GROUP BY extract(dow FROM day), hour
+SELECT extract(dow FROM local_ts)::smallint AS day_of_week,
+       extract(hour FROM local_ts)::smallint AS hour,
+       sum(listen_count)::bigint AS listen_count
+FROM (
+    SELECT (day::timestamp + hour * interval '1 hour') AT TIME ZONE 'UTC' AT TIME ZONE $1::text AS local_ts,
+           listen_count
+    FROM clock_cells
+    WHERE ($2::bigint IS NULL OR user_id = $2::bigint)
+      AND day >= $3::date
+      AND day < $4::date
+) shifted
+GROUP BY 1, 2
 `
 
 type RollupClockGridParams struct {
+	Tz      string      `json:"tz"`
 	UserID  *int64      `json:"user_id"`
 	FromDay pgtype.Date `json:"from_day"`
 	ToDay   pgtype.Date `json:"to_day"`
@@ -440,8 +393,14 @@ type RollupClockGridRow struct {
 	ListenCount int64 `json:"listen_count"`
 }
 
+// clock_cells stores day/hour in UTC; shift into tz here so hours reflect the caller's local time.
 func (q *Queries) RollupClockGrid(ctx context.Context, arg RollupClockGridParams) ([]RollupClockGridRow, error) {
-	rows, err := q.db.Query(ctx, rollupClockGrid, arg.UserID, arg.FromDay, arg.ToDay)
+	rows, err := q.db.Query(ctx, rollupClockGrid,
+		arg.Tz,
+		arg.UserID,
+		arg.FromDay,
+		arg.ToDay,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -524,7 +483,7 @@ func (q *Queries) RollupDiscoveryBuckets(ctx context.Context, arg RollupDiscover
 }
 
 const rollupEntitySummary = `-- name: RollupEntitySummary :one
-SELECT plays, unique_listeners, first_listened_at
+SELECT plays, unique_listeners, (played_ms::float8 / 60000.0)::float8 AS minutes_listened, first_listened_at
 FROM entity_global_stats
 WHERE entity_type = $1::entity_type AND entity_id = $2::bigint
 `
@@ -537,13 +496,19 @@ type RollupEntitySummaryParams struct {
 type RollupEntitySummaryRow struct {
 	Plays           int32              `json:"plays"`
 	UniqueListeners int32              `json:"unique_listeners"`
+	MinutesListened float64            `json:"minutes_listened"`
 	FirstListenedAt pgtype.Timestamptz `json:"first_listened_at"`
 }
 
 func (q *Queries) RollupEntitySummary(ctx context.Context, arg RollupEntitySummaryParams) (RollupEntitySummaryRow, error) {
 	row := q.db.QueryRow(ctx, rollupEntitySummary, arg.EntityType, arg.EntityID)
 	var i RollupEntitySummaryRow
-	err := row.Scan(&i.Plays, &i.UniqueListeners, &i.FirstListenedAt)
+	err := row.Scan(
+		&i.Plays,
+		&i.UniqueListeners,
+		&i.MinutesListened,
+		&i.FirstListenedAt,
+	)
 	return i, err
 }
 
@@ -603,7 +568,7 @@ func (q *Queries) RollupNewEntityCounts(ctx context.Context, arg RollupNewEntity
 
 const rollupSummaryStats = `-- name: RollupSummaryStats :one
 WITH scoped AS (
-    SELECT user_id, song_id, day, listen_count, minutes_ms FROM daily_song_listens dsl
+    SELECT user_id, song_id, day, listen_count, played_ms FROM daily_song_listens dsl
     WHERE ($1::bigint IS NULL OR dsl.user_id = $1::bigint)
       AND dsl.day >= $2::date
       AND dsl.day < $3::date
@@ -613,7 +578,7 @@ SELECT
     (SELECT count(DISTINCT song_id) FROM scoped)::bigint AS unique_tracks,
     (SELECT count(DISTINCT sa.album_id) FROM scoped s JOIN song_albums sa ON sa.song_id = s.song_id)::bigint AS unique_albums,
     (SELECT count(DISTINCT sar.artist_id) FROM scoped s JOIN song_artists sar ON sar.song_id = s.song_id)::bigint AS unique_artists,
-    ((SELECT coalesce(sum(minutes_ms), 0) FROM scoped)::float8 / 60000.0)::float8 AS minutes_listened,
+    ((SELECT coalesce(sum(played_ms), 0) FROM scoped)::float8 / 60000.0)::float8 AS minutes_listened,
     (SELECT count(DISTINCT day) FROM scoped)::bigint AS days_active
 `
 
@@ -648,39 +613,57 @@ func (q *Queries) RollupSummaryStats(ctx context.Context, arg RollupSummaryStats
 
 const rollupTopAlbums = `-- name: RollupTopAlbums :many
 WITH scoped AS (
-    SELECT user_id, song_id, day, listen_count, minutes_ms FROM daily_song_listens dsl
-    WHERE ($3::bigint IS NULL OR dsl.user_id = $3::bigint)
-      AND dsl.day >= $4::date
-      AND dsl.day < $5::date
+    SELECT user_id, song_id, day, listen_count, played_ms FROM daily_song_listens dsl
+    WHERE ($1::bigint IS NULL OR dsl.user_id = $1::bigint)
+      AND dsl.day >= $5::date
+      AND dsl.day < $6::date
 )
-SELECT sa.album_id, al.name, sum(s.listen_count)::bigint AS listen_count
+SELECT sa.album_id, al.name, al.image_id, sum(s.listen_count)::bigint AS listen_count,
+       (sum(s.played_ms)::float8 / 60000.0)::float8 AS minutes_listened,
+       coalesce((SELECT ar.id FROM album_artists aa2 JOIN artists ar ON ar.id = aa2.artist_id
+        WHERE aa2.album_id = sa.album_id ORDER BY aa2.position LIMIT 1), 0)::bigint AS artist_id,
+       coalesce((SELECT ar.name FROM album_artists aa2 JOIN artists ar ON ar.id = aa2.artist_id
+        WHERE aa2.album_id = sa.album_id ORDER BY aa2.position LIMIT 1), '')::text AS artist_name,
+       EXISTS (
+         SELECT 1 FROM album_artists aa3 JOIN artist_blacklist bl ON bl.artist_id = aa3.artist_id
+         WHERE aa3.album_id = sa.album_id AND bl.user_id = $1::bigint
+       ) AS blacklisted
 FROM scoped s
 JOIN song_albums sa ON sa.song_id = s.song_id
 JOIN albums al ON al.id = sa.album_id
-GROUP BY sa.album_id, al.name
-ORDER BY listen_count DESC, al.name
-LIMIT $2::int OFFSET $1::int
+GROUP BY sa.album_id, al.name, al.image_id
+ORDER BY blacklisted ASC,
+    (CASE WHEN $2::text = 'minutes' THEN sum(s.played_ms)::float8 ELSE sum(s.listen_count)::float8 END) DESC,
+    al.name
+LIMIT $4::int OFFSET $3::int
 `
 
 type RollupTopAlbumsParams struct {
+	UserID    *int64      `json:"user_id"`
+	SortBy    string      `json:"sort_by"`
 	RowOffset int32       `json:"row_offset"`
 	MaxRows   int32       `json:"max_rows"`
-	UserID    *int64      `json:"user_id"`
 	FromDay   pgtype.Date `json:"from_day"`
 	ToDay     pgtype.Date `json:"to_day"`
 }
 
 type RollupTopAlbumsRow struct {
-	AlbumID     int64  `json:"album_id"`
-	Name        string `json:"name"`
-	ListenCount int64  `json:"listen_count"`
+	AlbumID         int64       `json:"album_id"`
+	Name            string      `json:"name"`
+	ImageID         pgtype.UUID `json:"image_id"`
+	ListenCount     int64       `json:"listen_count"`
+	MinutesListened float64     `json:"minutes_listened"`
+	ArtistID        int64       `json:"artist_id"`
+	ArtistName      string      `json:"artist_name"`
+	Blacklisted     bool        `json:"blacklisted"`
 }
 
 func (q *Queries) RollupTopAlbums(ctx context.Context, arg RollupTopAlbumsParams) ([]RollupTopAlbumsRow, error) {
 	rows, err := q.db.Query(ctx, rollupTopAlbums,
+		arg.UserID,
+		arg.SortBy,
 		arg.RowOffset,
 		arg.MaxRows,
-		arg.UserID,
 		arg.FromDay,
 		arg.ToDay,
 	)
@@ -691,7 +674,16 @@ func (q *Queries) RollupTopAlbums(ctx context.Context, arg RollupTopAlbumsParams
 	var items []RollupTopAlbumsRow
 	for rows.Next() {
 		var i RollupTopAlbumsRow
-		if err := rows.Scan(&i.AlbumID, &i.Name, &i.ListenCount); err != nil {
+		if err := rows.Scan(
+			&i.AlbumID,
+			&i.Name,
+			&i.ImageID,
+			&i.ListenCount,
+			&i.MinutesListened,
+			&i.ArtistID,
+			&i.ArtistName,
+			&i.Blacklisted,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -704,39 +696,53 @@ func (q *Queries) RollupTopAlbums(ctx context.Context, arg RollupTopAlbumsParams
 
 const rollupTopArtists = `-- name: RollupTopArtists :many
 WITH scoped AS (
-    SELECT user_id, song_id, day, listen_count, minutes_ms FROM daily_song_listens dsl
-    WHERE ($3::bigint IS NULL OR dsl.user_id = $3::bigint)
-      AND dsl.day >= $4::date
-      AND dsl.day < $5::date
+    SELECT user_id, song_id, day, listen_count, played_ms FROM daily_song_listens dsl
+    WHERE ($1::bigint IS NULL OR dsl.user_id = $1::bigint)
+      AND dsl.day >= $5::date
+      AND dsl.day < $6::date
 )
-SELECT sar.artist_id, a.name, sum(s.listen_count)::bigint AS listen_count
+SELECT sar.artist_id, a.name, a.image_id, sum(s.listen_count)::bigint AS listen_count,
+       (sum(s.played_ms)::float8 / 60000.0)::float8 AS minutes_listened,
+       EXISTS (
+         SELECT 1 FROM artist_blacklist bl
+         WHERE bl.user_id = $1::bigint AND bl.artist_id = sar.artist_id
+       ) AS blacklisted
 FROM scoped s
 JOIN song_artists sar ON sar.song_id = s.song_id
 JOIN artists a ON a.id = sar.artist_id
-GROUP BY sar.artist_id, a.name
-ORDER BY listen_count DESC, a.name
-LIMIT $2::int OFFSET $1::int
+GROUP BY sar.artist_id, a.name, a.image_id
+ORDER BY blacklisted ASC,
+    (CASE WHEN $2::text = 'minutes' THEN sum(s.played_ms)::float8 ELSE sum(s.listen_count)::float8 END) DESC,
+    a.name
+LIMIT $4::int OFFSET $3::int
 `
 
 type RollupTopArtistsParams struct {
+	UserID    *int64      `json:"user_id"`
+	SortBy    string      `json:"sort_by"`
 	RowOffset int32       `json:"row_offset"`
 	MaxRows   int32       `json:"max_rows"`
-	UserID    *int64      `json:"user_id"`
 	FromDay   pgtype.Date `json:"from_day"`
 	ToDay     pgtype.Date `json:"to_day"`
 }
 
 type RollupTopArtistsRow struct {
-	ArtistID    int64  `json:"artist_id"`
-	Name        string `json:"name"`
-	ListenCount int64  `json:"listen_count"`
+	ArtistID        int64       `json:"artist_id"`
+	Name            string      `json:"name"`
+	ImageID         pgtype.UUID `json:"image_id"`
+	ListenCount     int64       `json:"listen_count"`
+	MinutesListened float64     `json:"minutes_listened"`
+	Blacklisted     bool        `json:"blacklisted"`
 }
 
+// blacklisted is always false for the global scope (user_id NULL): blacklisting is a personal
+// preference, not something one user's opinion should reorder for everyone else.
 func (q *Queries) RollupTopArtists(ctx context.Context, arg RollupTopArtistsParams) ([]RollupTopArtistsRow, error) {
 	rows, err := q.db.Query(ctx, rollupTopArtists,
+		arg.UserID,
+		arg.SortBy,
 		arg.RowOffset,
 		arg.MaxRows,
-		arg.UserID,
 		arg.FromDay,
 		arg.ToDay,
 	)
@@ -747,7 +753,14 @@ func (q *Queries) RollupTopArtists(ctx context.Context, arg RollupTopArtistsPara
 	var items []RollupTopArtistsRow
 	for rows.Next() {
 		var i RollupTopArtistsRow
-		if err := rows.Scan(&i.ArtistID, &i.Name, &i.ListenCount); err != nil {
+		if err := rows.Scan(
+			&i.ArtistID,
+			&i.Name,
+			&i.ImageID,
+			&i.ListenCount,
+			&i.MinutesListened,
+			&i.Blacklisted,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -789,27 +802,43 @@ func (q *Queries) RollupTopDay(ctx context.Context, arg RollupTopDayParams) (Rol
 
 const rollupTopTracks = `-- name: RollupTopTracks :many
 WITH scoped AS (
-    SELECT user_id, song_id, day, listen_count, minutes_ms FROM daily_song_listens dsl
-    WHERE ($3::bigint IS NULL OR dsl.user_id = $3::bigint)
-      AND dsl.day >= $4::date
-      AND dsl.day < $5::date
-      AND ($6::bigint IS NULL OR EXISTS (
-            SELECT 1 FROM song_artists sar WHERE sar.song_id = dsl.song_id AND sar.artist_id = $6::bigint))
+    SELECT user_id, song_id, day, listen_count, played_ms FROM daily_song_listens dsl
+    WHERE ($1::bigint IS NULL OR dsl.user_id = $1::bigint)
+      AND dsl.day >= $5::date
+      AND dsl.day < $6::date
       AND ($7::bigint IS NULL OR EXISTS (
-            SELECT 1 FROM song_albums sa2 WHERE sa2.song_id = dsl.song_id AND sa2.album_id = $7::bigint))
+            SELECT 1 FROM song_artists sar WHERE sar.song_id = dsl.song_id AND sar.artist_id = $7::bigint))
+      AND ($8::bigint IS NULL OR EXISTS (
+            SELECT 1 FROM song_albums sa2 WHERE sa2.song_id = dsl.song_id AND sa2.album_id = $8::bigint))
 )
-SELECT s.song_id, sg.name, sum(s.listen_count)::bigint AS listen_count
+SELECT s.song_id, sg.name, sg.image_id, sum(s.listen_count)::bigint AS listen_count,
+       (sum(s.played_ms)::float8 / 60000.0)::float8 AS minutes_listened,
+       coalesce((SELECT ar.id FROM song_artists sar2 JOIN artists ar ON ar.id = sar2.artist_id
+        WHERE sar2.song_id = s.song_id ORDER BY sar2.position LIMIT 1), 0)::bigint AS artist_id,
+       coalesce((SELECT ar.name FROM song_artists sar2 JOIN artists ar ON ar.id = sar2.artist_id
+        WHERE sar2.song_id = s.song_id ORDER BY sar2.position LIMIT 1), '')::text AS artist_name,
+       coalesce((SELECT al.id FROM song_albums sal JOIN albums al ON al.id = sal.album_id
+        WHERE sal.song_id = s.song_id ORDER BY sal.track_number LIMIT 1), 0)::bigint AS album_id,
+       coalesce((SELECT al.name FROM song_albums sal JOIN albums al ON al.id = sal.album_id
+        WHERE sal.song_id = s.song_id ORDER BY sal.track_number LIMIT 1), '')::text AS album_name,
+       EXISTS (
+         SELECT 1 FROM song_artists sar3 JOIN artist_blacklist bl ON bl.artist_id = sar3.artist_id
+         WHERE sar3.song_id = s.song_id AND bl.user_id = $1::bigint
+       ) AS blacklisted
 FROM scoped s
 JOIN songs sg ON sg.id = s.song_id
-GROUP BY s.song_id, sg.name
-ORDER BY listen_count DESC, sg.name
-LIMIT $2::int OFFSET $1::int
+GROUP BY s.song_id, sg.name, sg.image_id
+ORDER BY blacklisted ASC,
+    (CASE WHEN $2::text = 'minutes' THEN sum(s.played_ms)::float8 ELSE sum(s.listen_count)::float8 END) DESC,
+    sg.name
+LIMIT $4::int OFFSET $3::int
 `
 
 type RollupTopTracksParams struct {
+	UserID    *int64      `json:"user_id"`
+	SortBy    string      `json:"sort_by"`
 	RowOffset int32       `json:"row_offset"`
 	MaxRows   int32       `json:"max_rows"`
-	UserID    *int64      `json:"user_id"`
 	FromDay   pgtype.Date `json:"from_day"`
 	ToDay     pgtype.Date `json:"to_day"`
 	ArtistID  *int64      `json:"artist_id"`
@@ -817,16 +846,24 @@ type RollupTopTracksParams struct {
 }
 
 type RollupTopTracksRow struct {
-	SongID      int64  `json:"song_id"`
-	Name        string `json:"name"`
-	ListenCount int64  `json:"listen_count"`
+	SongID          int64       `json:"song_id"`
+	Name            string      `json:"name"`
+	ImageID         pgtype.UUID `json:"image_id"`
+	ListenCount     int64       `json:"listen_count"`
+	MinutesListened float64     `json:"minutes_listened"`
+	ArtistID        int64       `json:"artist_id"`
+	ArtistName      string      `json:"artist_name"`
+	AlbumID         int64       `json:"album_id"`
+	AlbumName       string      `json:"album_name"`
+	Blacklisted     bool        `json:"blacklisted"`
 }
 
 func (q *Queries) RollupTopTracks(ctx context.Context, arg RollupTopTracksParams) ([]RollupTopTracksRow, error) {
 	rows, err := q.db.Query(ctx, rollupTopTracks,
+		arg.UserID,
+		arg.SortBy,
 		arg.RowOffset,
 		arg.MaxRows,
-		arg.UserID,
 		arg.FromDay,
 		arg.ToDay,
 		arg.ArtistID,
@@ -839,7 +876,18 @@ func (q *Queries) RollupTopTracks(ctx context.Context, arg RollupTopTracksParams
 	var items []RollupTopTracksRow
 	for rows.Next() {
 		var i RollupTopTracksRow
-		if err := rows.Scan(&i.SongID, &i.Name, &i.ListenCount); err != nil {
+		if err := rows.Scan(
+			&i.SongID,
+			&i.Name,
+			&i.ImageID,
+			&i.ListenCount,
+			&i.MinutesListened,
+			&i.ArtistID,
+			&i.ArtistName,
+			&i.AlbumID,
+			&i.AlbumName,
+			&i.Blacklisted,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -887,7 +935,7 @@ func (q *Queries) UpsertClockCells(ctx context.Context, arg UpsertClockCellsPara
 }
 
 const upsertDailySongListens = `-- name: UpsertDailySongListens :exec
-INSERT INTO daily_song_listens (user_id, song_id, day, listen_count, minutes_ms)
+INSERT INTO daily_song_listens (user_id, song_id, day, listen_count, played_ms)
 SELECT unnest($1::bigint[]),
        unnest($2::bigint[]),
        unnest($3::date[]),
@@ -895,7 +943,7 @@ SELECT unnest($1::bigint[]),
        unnest($5::bigint[])
 ON CONFLICT (user_id, song_id, day) DO UPDATE SET
     listen_count = daily_song_listens.listen_count + excluded.listen_count,
-    minutes_ms = daily_song_listens.minutes_ms + excluded.minutes_ms
+    played_ms = daily_song_listens.played_ms + excluded.played_ms
 `
 
 type UpsertDailySongListensParams struct {
@@ -903,7 +951,7 @@ type UpsertDailySongListensParams struct {
 	SongIds      []int64       `json:"song_ids"`
 	Days         []pgtype.Date `json:"days"`
 	ListenCounts []int32       `json:"listen_counts"`
-	MinutesMs    []int64       `json:"minutes_ms"`
+	PlayedMs     []int64       `json:"played_ms"`
 }
 
 func (q *Queries) UpsertDailySongListens(ctx context.Context, arg UpsertDailySongListensParams) error {
@@ -912,19 +960,21 @@ func (q *Queries) UpsertDailySongListens(ctx context.Context, arg UpsertDailySon
 		arg.SongIds,
 		arg.Days,
 		arg.ListenCounts,
-		arg.MinutesMs,
+		arg.PlayedMs,
 	)
 	return err
 }
 
 const upsertEntityGlobalPlays = `-- name: UpsertEntityGlobalPlays :exec
-INSERT INTO entity_global_stats (entity_type, entity_id, plays, first_listened_at)
+INSERT INTO entity_global_stats (entity_type, entity_id, plays, played_ms, first_listened_at)
 SELECT unnest($1::text[])::entity_type,
        unnest($2::bigint[]),
        unnest($3::int[]),
-       unnest($4::timestamptz[])
+       unnest($4::bigint[]),
+       unnest($5::timestamptz[])
 ON CONFLICT (entity_type, entity_id) DO UPDATE SET
     plays = entity_global_stats.plays + excluded.plays,
+    played_ms = entity_global_stats.played_ms + excluded.played_ms,
     first_listened_at = LEAST(entity_global_stats.first_listened_at, excluded.first_listened_at)
 `
 
@@ -932,6 +982,7 @@ type UpsertEntityGlobalPlaysParams struct {
 	EntityTypes []string             `json:"entity_types"`
 	EntityIds   []int64              `json:"entity_ids"`
 	Plays       []int32              `json:"plays"`
+	PlayedMs    []int64              `json:"played_ms"`
 	FirstAts    []pgtype.Timestamptz `json:"first_ats"`
 }
 
@@ -940,6 +991,7 @@ func (q *Queries) UpsertEntityGlobalPlays(ctx context.Context, arg UpsertEntityG
 		arg.EntityTypes,
 		arg.EntityIds,
 		arg.Plays,
+		arg.PlayedMs,
 		arg.FirstAts,
 	)
 	return err

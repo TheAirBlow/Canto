@@ -35,6 +35,10 @@ func (e *Engine) Discovery(ctx context.Context, userID *int64, tf Timeframe, ste
 	if err != nil {
 		return nil, err
 	}
+	from, err = e.clampToEarliestListen(ctx, userID, from)
+	if err != nil {
+		return nil, err
+	}
 	key := cacheKey{UserID: userID, Resource: db.StatsResourceDiscovery, Params: discoveryParams{Timeframe: tf, Step: step}}
 	return e.cached(ctx, key, func(ctx context.Context) (any, error) {
 		return e.computeDiscovery(ctx, userID, from, to, interval)

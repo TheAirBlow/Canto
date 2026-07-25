@@ -12,21 +12,23 @@ import (
 )
 
 const createArtist = `-- name: CreateArtist :one
-INSERT INTO artists (name, name_normalized) VALUES ($1, $2) RETURNING id, name, name_normalized, description, image_id, pinned, created_at, updated_at
+INSERT INTO artists (name, name_normalized, name_romanized) VALUES ($1, $2, $3) RETURNING id, name, name_normalized, name_romanized, description, image_id, pinned, created_at, updated_at
 `
 
 type CreateArtistParams struct {
 	Name           string `json:"name"`
 	NameNormalized string `json:"name_normalized"`
+	NameRomanized  string `json:"name_romanized"`
 }
 
 func (q *Queries) CreateArtist(ctx context.Context, arg CreateArtistParams) (Artist, error) {
-	row := q.db.QueryRow(ctx, createArtist, arg.Name, arg.NameNormalized)
+	row := q.db.QueryRow(ctx, createArtist, arg.Name, arg.NameNormalized, arg.NameRomanized)
 	var i Artist
 	err := row.Scan(
 		&i.ID,
 		&i.Name,
 		&i.NameNormalized,
+		&i.NameRomanized,
 		&i.Description,
 		&i.ImageID,
 		&i.Pinned,
@@ -49,7 +51,7 @@ func (q *Queries) DeleteArtist(ctx context.Context, id int64) (int64, error) {
 }
 
 const findArtistByExactName = `-- name: FindArtistByExactName :one
-SELECT id, name, name_normalized, description, image_id, pinned, created_at, updated_at FROM artists WHERE name = $1 OR name_normalized = $1 LIMIT 1
+SELECT id, name, name_normalized, name_romanized, description, image_id, pinned, created_at, updated_at FROM artists WHERE name = $1 LIMIT 1
 `
 
 func (q *Queries) FindArtistByExactName(ctx context.Context, name string) (Artist, error) {
@@ -59,6 +61,7 @@ func (q *Queries) FindArtistByExactName(ctx context.Context, name string) (Artis
 		&i.ID,
 		&i.Name,
 		&i.NameNormalized,
+		&i.NameRomanized,
 		&i.Description,
 		&i.ImageID,
 		&i.Pinned,
@@ -69,7 +72,7 @@ func (q *Queries) FindArtistByExactName(ctx context.Context, name string) (Artis
 }
 
 const findArtistBySource = `-- name: FindArtistBySource :one
-SELECT a.id, a.name, a.name_normalized, a.description, a.image_id, a.pinned, a.created_at, a.updated_at FROM artists a
+SELECT a.id, a.name, a.name_normalized, a.name_romanized, a.description, a.image_id, a.pinned, a.created_at, a.updated_at FROM artists a
 JOIN sources s ON s.entity_type = 'artist' AND s.entity_id = a.id
 WHERE s.source_type = $1 AND s.extracted_id = $2
 `
@@ -86,6 +89,7 @@ func (q *Queries) FindArtistBySource(ctx context.Context, arg FindArtistBySource
 		&i.ID,
 		&i.Name,
 		&i.NameNormalized,
+		&i.NameRomanized,
 		&i.Description,
 		&i.ImageID,
 		&i.Pinned,
@@ -95,8 +99,42 @@ func (q *Queries) FindArtistBySource(ctx context.Context, arg FindArtistBySource
 	return i, err
 }
 
+const findArtistsByExactName = `-- name: FindArtistsByExactName :many
+SELECT id, name, name_normalized, name_romanized, description, image_id, pinned, created_at, updated_at FROM artists WHERE name = $1
+`
+
+func (q *Queries) FindArtistsByExactName(ctx context.Context, name string) ([]Artist, error) {
+	rows, err := q.db.Query(ctx, findArtistsByExactName, name)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Artist
+	for rows.Next() {
+		var i Artist
+		if err := rows.Scan(
+			&i.ID,
+			&i.Name,
+			&i.NameNormalized,
+			&i.NameRomanized,
+			&i.Description,
+			&i.ImageID,
+			&i.Pinned,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const getArtistByID = `-- name: GetArtistByID :one
-SELECT id, name, name_normalized, description, image_id, pinned, created_at, updated_at FROM artists WHERE id = $1
+SELECT id, name, name_normalized, name_romanized, description, image_id, pinned, created_at, updated_at FROM artists WHERE id = $1
 `
 
 func (q *Queries) GetArtistByID(ctx context.Context, id int64) (Artist, error) {
@@ -106,6 +144,7 @@ func (q *Queries) GetArtistByID(ctx context.Context, id int64) (Artist, error) {
 		&i.ID,
 		&i.Name,
 		&i.NameNormalized,
+		&i.NameRomanized,
 		&i.Description,
 		&i.ImageID,
 		&i.Pinned,
@@ -116,7 +155,7 @@ func (q *Queries) GetArtistByID(ctx context.Context, id int64) (Artist, error) {
 }
 
 const getArtistsByIDs = `-- name: GetArtistsByIDs :many
-SELECT id, name, name_normalized, description, image_id, pinned, created_at, updated_at FROM artists WHERE id = ANY($1::bigint[])
+SELECT id, name, name_normalized, name_romanized, description, image_id, pinned, created_at, updated_at FROM artists WHERE id = ANY($1::bigint[])
 `
 
 func (q *Queries) GetArtistsByIDs(ctx context.Context, ids []int64) ([]Artist, error) {
@@ -132,6 +171,7 @@ func (q *Queries) GetArtistsByIDs(ctx context.Context, ids []int64) ([]Artist, e
 			&i.ID,
 			&i.Name,
 			&i.NameNormalized,
+			&i.NameRomanized,
 			&i.Description,
 			&i.ImageID,
 			&i.Pinned,
@@ -149,7 +189,7 @@ func (q *Queries) GetArtistsByIDs(ctx context.Context, ids []int64) ([]Artist, e
 }
 
 const listAlbumsForArtist = `-- name: ListAlbumsForArtist :many
-SELECT al.id, al.name, al.name_normalized, al.release_date, al.description, al.image_id, al.pinned, al.created_at, al.updated_at FROM albums al
+SELECT al.id, al.name, al.name_normalized, al.name_romanized, al.release_date, al.description, al.image_id, al.pinned, al.created_at, al.updated_at FROM albums al
 JOIN album_artists aa ON aa.album_id = al.id
 WHERE aa.artist_id = $1
 ORDER BY al.release_date NULLS LAST, al.name
@@ -168,6 +208,7 @@ func (q *Queries) ListAlbumsForArtist(ctx context.Context, artistID int64) ([]Al
 			&i.ID,
 			&i.Name,
 			&i.NameNormalized,
+			&i.NameRomanized,
 			&i.ReleaseDate,
 			&i.Description,
 			&i.ImageID,
@@ -186,7 +227,7 @@ func (q *Queries) ListAlbumsForArtist(ctx context.Context, artistID int64) ([]Al
 }
 
 const listArtists = `-- name: ListArtists :many
-SELECT id, name, name_normalized, description, image_id, pinned, created_at, updated_at FROM artists WHERE id > $1::bigint ORDER BY id LIMIT $2::int
+SELECT id, name, name_normalized, name_romanized, description, image_id, pinned, created_at, updated_at FROM artists WHERE id > $1::bigint ORDER BY id LIMIT $2::int
 `
 
 type ListArtistsParams struct {
@@ -207,6 +248,7 @@ func (q *Queries) ListArtists(ctx context.Context, arg ListArtistsParams) ([]Art
 			&i.ID,
 			&i.Name,
 			&i.NameNormalized,
+			&i.NameRomanized,
 			&i.Description,
 			&i.ImageID,
 			&i.Pinned,
@@ -224,7 +266,7 @@ func (q *Queries) ListArtists(ctx context.Context, arg ListArtistsParams) ([]Art
 }
 
 const listSongsForArtist = `-- name: ListSongsForArtist :many
-SELECT s.id, s.name, s.name_normalized, s.duration_ms, s.image_id, s.pinned, s.created_at, s.updated_at FROM songs s
+SELECT s.id, s.name, s.name_normalized, s.name_romanized, s.duration_ms, s.image_id, s.pinned, s.created_at, s.updated_at FROM songs s
 JOIN song_artists sa ON sa.song_id = s.id
 WHERE sa.artist_id = $1
 ORDER BY s.name
@@ -243,6 +285,7 @@ func (q *Queries) ListSongsForArtist(ctx context.Context, artistID int64) ([]Son
 			&i.ID,
 			&i.Name,
 			&i.NameNormalized,
+			&i.NameRomanized,
 			&i.DurationMs,
 			&i.ImageID,
 			&i.Pinned,
@@ -260,7 +303,7 @@ func (q *Queries) ListSongsForArtist(ctx context.Context, artistID int64) ([]Son
 }
 
 const listStaleArtists = `-- name: ListStaleArtists :many
-SELECT id, name, name_normalized, description, image_id, pinned, created_at, updated_at FROM artists WHERE updated_at < $1::timestamptz AND NOT pinned ORDER BY updated_at LIMIT $2::int
+SELECT id, name, name_normalized, name_romanized, description, image_id, pinned, created_at, updated_at FROM artists WHERE updated_at < $1::timestamptz AND NOT pinned ORDER BY updated_at LIMIT $2::int
 `
 
 type ListStaleArtistsParams struct {
@@ -281,6 +324,7 @@ func (q *Queries) ListStaleArtists(ctx context.Context, arg ListStaleArtistsPara
 			&i.ID,
 			&i.Name,
 			&i.NameNormalized,
+			&i.NameRomanized,
 			&i.Description,
 			&i.ImageID,
 			&i.Pinned,
@@ -298,7 +342,7 @@ func (q *Queries) ListStaleArtists(ctx context.Context, arg ListStaleArtistsPara
 }
 
 const setArtistImage = `-- name: SetArtistImage :one
-UPDATE artists SET image_id = $2, pinned = TRUE, updated_at = now() WHERE id = $1 RETURNING id, name, name_normalized, description, image_id, pinned, created_at, updated_at
+UPDATE artists SET image_id = $2, pinned = TRUE, updated_at = now() WHERE id = $1 RETURNING id, name, name_normalized, name_romanized, description, image_id, pinned, created_at, updated_at
 `
 
 type SetArtistImageParams struct {
@@ -313,6 +357,7 @@ func (q *Queries) SetArtistImage(ctx context.Context, arg SetArtistImageParams) 
 		&i.ID,
 		&i.Name,
 		&i.NameNormalized,
+		&i.NameRomanized,
 		&i.Description,
 		&i.ImageID,
 		&i.Pinned,
@@ -323,7 +368,7 @@ func (q *Queries) SetArtistImage(ctx context.Context, arg SetArtistImageParams) 
 }
 
 const setArtistPinned = `-- name: SetArtistPinned :one
-UPDATE artists SET pinned = $2 WHERE id = $1 RETURNING id, name, name_normalized, description, image_id, pinned, created_at, updated_at
+UPDATE artists SET pinned = $2 WHERE id = $1 RETURNING id, name, name_normalized, name_romanized, description, image_id, pinned, created_at, updated_at
 `
 
 type SetArtistPinnedParams struct {
@@ -338,6 +383,7 @@ func (q *Queries) SetArtistPinned(ctx context.Context, arg SetArtistPinnedParams
 		&i.ID,
 		&i.Name,
 		&i.NameNormalized,
+		&i.NameRomanized,
 		&i.Description,
 		&i.ImageID,
 		&i.Pinned,
@@ -348,13 +394,14 @@ func (q *Queries) SetArtistPinned(ctx context.Context, arg SetArtistPinnedParams
 }
 
 const updateArtist = `-- name: UpdateArtist :one
-UPDATE artists SET name = $2, name_normalized = $3, description = $4, pinned = TRUE, updated_at = now() WHERE id = $1 RETURNING id, name, name_normalized, description, image_id, pinned, created_at, updated_at
+UPDATE artists SET name = $2, name_normalized = $3, name_romanized = $4, description = $5, pinned = TRUE, updated_at = now() WHERE id = $1 RETURNING id, name, name_normalized, name_romanized, description, image_id, pinned, created_at, updated_at
 `
 
 type UpdateArtistParams struct {
 	ID             int64   `json:"id"`
 	Name           string  `json:"name"`
 	NameNormalized string  `json:"name_normalized"`
+	NameRomanized  string  `json:"name_romanized"`
 	Description    *string `json:"description"`
 }
 
@@ -363,6 +410,7 @@ func (q *Queries) UpdateArtist(ctx context.Context, arg UpdateArtistParams) (Art
 		arg.ID,
 		arg.Name,
 		arg.NameNormalized,
+		arg.NameRomanized,
 		arg.Description,
 	)
 	var i Artist
@@ -370,6 +418,7 @@ func (q *Queries) UpdateArtist(ctx context.Context, arg UpdateArtistParams) (Art
 		&i.ID,
 		&i.Name,
 		&i.NameNormalized,
+		&i.NameRomanized,
 		&i.Description,
 		&i.ImageID,
 		&i.Pinned,
